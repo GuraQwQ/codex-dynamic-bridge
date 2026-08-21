@@ -113,7 +113,7 @@ codex plugin add codex-dynamic-bridge@codex-dynamic-bridge
 3. 检查插件是否可见：
 
 ```powershell
-codex plugin list --marketplace codex-dynamic-bridge --available
+codex plugin list --json --marketplace codex-dynamic-bridge --available
 ```
 
 4. 新建 Codex 任务以加载新技能。已有任务不会自动重新加载刚安装的技能。
@@ -517,7 +517,7 @@ codex plugin add codex-dynamic-bridge@codex-dynamic-bridge
 3. Verify that Codex can see it:
 
 ```powershell
-codex plugin list --marketplace codex-dynamic-bridge --available
+codex plugin list --json --marketplace codex-dynamic-bridge --available
 ```
 
 4. Start a new Codex task so the newly installed skill is loaded. Existing tasks do not automatically reload newly installed skills.
