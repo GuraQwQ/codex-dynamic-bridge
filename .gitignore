@@ -8,3 +8,8 @@ __pycache__/
 venv/
 external_links.json
 links.json
+tasks.json
+events.jsonl
+endpoint.json
+schedules.json
+companion/**/data/

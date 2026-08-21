@@ -56,6 +56,13 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - 发现 Antigravity 当前暴露的本机会话及其 conversation ID。
 - 检查页面焦点、加载状态、视口和活动元素。
 - 读取当前会话或指定元素的完整可见文本。
+- 生成可访问性快照，并按角色与可访问名称控制 UI。
+- 新建、继续、等待、切换、重命名、分叉或取消会话。
+- 列出和切换模型，指定 reasoning effort，并读取模型用量。
+- 打开或创建项目，读取和修改全局/项目设置。
+- 读取产物、批准计划、汇总工具与子 Agent 活动。
+- 通过 Companion Sidecar 接收 Hook 事件并运行计划任务。
+- 维护 Codex 任务与 Antigravity 会话的双向映射。
 - 等待指定元素进入 attached、detached、visible 或 hidden 状态。
 - 在用户明确授权具体动作后点击、填充或发送按键。
 - 保存、列出、合并和删除本地会话链接元数据。
@@ -70,6 +77,24 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - Python 3.10 或更高版本。
 - 元数据命令只使用 Python 标准库。
 - `control` 命令需要 Python Playwright，但不需要单独安装 Chromium。
+- 结构化 headless 会话可选使用官方 `agy` CLI。
+- 事件、等待和计划任务可选使用仓库内的 Antigravity Companion Sidecar。
+
+### 能力层级
+
+首先运行：
+
+```powershell
+python -m bridge.cli doctor
+```
+
+插件会探测三个后端：
+
+1. **Desktop CDP**：读取、可访问性快照及语义桌面控制。
+2. **Antigravity CLI (`agy`)**：按项目、模型和 effort 新建或继续 headless 会话，并返回结构化 JSON。
+3. **Companion Sidecar**：通过官方 `agentapi` 新建/发送，接收 Hook 完成事件并管理计划任务。
+
+未安装可选后端时，`doctor` 会报告能力缺口，不会自动安装依赖。写操作开始后不会跨后端自动重试。
 
 ### 安装与验证
 
@@ -104,6 +129,12 @@ codex plugin list --marketplace codex-dynamic-bridge --available
 
 预期结果是会话 JSON 列表；若 Antigravity 未运行，应收到明确的调试端口文件错误，而不是执行页面修改。
 
+6. 需要稳定事件、等待或计划任务时，在同一个新任务中发送以下授权提示。Codex 会从已安装插件位置运行命令，不需要你查找其缓存目录：
+
+```text
+使用 Codex Dynamic Bridge 检查全局 Companion；如果尚未安装，使用默认项目 default-cli-project 一次性安装，我授权此次安装
+```
+
 ### 推荐提示词
 
 ```text
@@ -127,6 +158,89 @@ codex plugin list --marketplace codex-dynamic-bridge --available
 ### 命令参考
 
 以下开发命令应在 `plugins/codex-dynamic-bridge` 目录中运行。正常使用时应直接让 Codex 调用插件技能。
+
+P1-P3 领域命令：
+
+```powershell
+# 能力探测
+python -m bridge.cli doctor
+
+# 新建、继续和等待会话；提示词优先通过标准输入传入
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-id <project-id> --model <slug> --effort high --confirm-create
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
+python -m bridge.cli conversation wait --conversation-id <id>
+
+# 桌面会话、模型和项目
+python -m bridge.cli conversation switch --id <id> --target <title> --confirm-conversation
+python -m bridge.cli conversation rename --id <id> --name <name> --confirm-conversation
+python -m bridge.cli conversation fork --id <id> --project-id <project-id> --confirm-conversation
+python -m bridge.cli conversation cancel --id <id> --confirm-conversation
+python -m bridge.cli model list
+python -m bridge.cli model desktop-list --id <id>
+python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
+python -m bridge.cli project open --id <id> --name <project-name> --confirm-project
+python -m bridge.cli project new --id <id> --confirm-project
+
+# 设置、用量、产物、活动和任务映射
+python -m bridge.cli settings read --id <id>
+python -m bridge.cli settings set --id <id> --label <accessible-label> --value <value> --confirm-settings
+python -m bridge.cli usage --id <id>
+python -m bridge.cli artifact list --conversation-id <id>
+python -m bridge.cli artifact read --conversation-id <id> --path <relative-path>
+python -m bridge.cli artifact proceed --id <id> --confirm-artifact
+python -m bridge.cli activity --conversation-id <id>
+python -m bridge.cli task link --conversation-id <id> --codex-task-id <codex-id> --project-id <project-id>
+
+# Hook 事件和 Sidecar 计划任务
+python -m bridge.cli event sync
+python -m bridge.cli event list --conversation-id <id>
+Get-Content -Raw .\prompt.txt | python -m bridge.cli schedule create --prompt-stdin --interval-seconds 3600 --confirm-schedule
+python -m bridge.cli schedule list
+python -m bridge.cli schedule remove --schedule-id <id> --confirm-schedule
+```
+
+### 一次性启用全局 Companion Sidecar
+
+无需再给每个 Antigravity 工作区安装伴生插件。正常使用时，在已加载插件的新 Codex 任务中发送：
+
+```text
+使用 Codex Dynamic Bridge 检查全局 Companion；如果尚未安装，使用默认项目 default-cli-project 一次性安装，我授权此次安装
+```
+
+Codex 会定位已安装插件并自动检测正在运行的 Antigravity。安装器把 Companion 暂存并原子替换到官方全局目录 `$HOME\.gemini\config\plugins\codex-dynamic-bridge`，同时只合并自己的 Sidecar 配置，不覆盖 `config.json` 的其他字段。
+
+下面的 CLI 只供源码检出目录中的开发和排障使用；先进入仓库内的插件目录：
+
+```powershell
+Set-Location .\plugins\codex-dynamic-bridge
+python -m bridge.cli companion status
+python -m bridge.cli companion install-global --confirm-install
+```
+
+Sidecar 使用 Antigravity 官方 `agentapi`，只绑定 `127.0.0.1`，每次启动生成随机令牌。默认项目是官方定义的 `default-cli-project`；需要绑定其他已知项目时才追加 `--project-id <project-id>`。一次配置后，所有 Antigravity 工作区共用该全局 Companion，不必重复复制插件。
+
+如果 Antigravity 正在运行，安装结果为 `restartRequired: true`；未运行时为 `false`。完成当前工作后完全退出所有 Antigravity 进程，再启动一次，然后让 Codex “检查 Codex Dynamic Bridge 的 Companion 和 doctor 状态”，或在源码插件目录运行：
+
+```powershell
+python -m bridge.cli companion status
+python -m bridge.cli doctor
+```
+
+成功判据：`companion status` 的 `installed`、`enabled`、`endpointReady` 与 `antigravityRunning` 均为 `true`，`projectId` 为预期项目；`doctor` 的 `sidecar.available` 为 `true`。至少完成一次 Antigravity 任务后，在 Codex 中发送以下只读提示；能返回最新事件才表示 Hook 链路也已工作：
+
+```text
+使用 Codex Dynamic Bridge 同步 Sidecar Hook 事件并列出最新 10 条；不要修改 Antigravity 会话
+```
+
+这里使用官方全局插件发现机制，不对 Electron 进程做版本敏感的热注入，也不会自动关闭或重启 Antigravity。安装器会生成符合官方格式的 `hooks.json`；事件上报失败时 fail-open，不会阻断 Antigravity。需要移除时，先在 Codex 中发送“使用 Codex Dynamic Bridge 卸载全局 Companion，我授权此次卸载”，或在源码插件目录运行：
+
+```powershell
+python -m bridge.cli companion uninstall-global --confirm-uninstall
+```
+
+卸载只删除本插件目录和 `codex-dynamic-bridge/codex-bridge` 配置项，保留其他 Antigravity 配置与 Sidecar。
+
+Sidecar 运行数据位于 `$HOME\.gemini\antigravity\sidecar_data\codex-dynamic-bridge\codex-bridge\`。定时任务提示词保存在 `data\schedules.json` 才能重复执行，但模型回复正文不会写入该文件。`uninstall-global` 默认保留该运行数据；需要彻底清理时，先确认不再需要计划任务，再核对并手动删除上述 `codex-bridge` 目录。
 
 ```powershell
 # 发现会话
@@ -172,13 +286,15 @@ python -m bridge.cli sync --source .\external-links.json
 
 ### 权限与安全边界
 
-- `discover`、`inspect`、`read`、`get` 和 `wait` 是只读操作。
+- `doctor`、`discover`、`inspect`、`read`、`snapshot`、`get`、`wait`、设置读取、事件/活动/产物列表是只读操作。
 - 用户明确要求读取、总结或检查会话正文时，插件可读取所选会话的完整可见文本，无需额外选择器。
 - `click`、`fill` 和 `press` 只有在用户明确授权当前具体动作后才能使用 `--confirm-control`。
+- 会话、模型、项目、设置、产物和计划任务分别使用 `--confirm-create/send/conversation/model/project/settings/artifact/schedule`，授权不可互换。
 - 插件不提供任意 JavaScript、任意导航、关闭页面、文件上传或下载命令。
 - 插件只连接 `127.0.0.1`、`localhost` 或 `::1` 上的 Antigravity 会话。
 - 页面修改命令返回错误并不能证明页面完全没有发生变化，因此插件不会自动重试写操作。
 - 插件不会主动读取无关会话、账号凭据或模型内部状态。
+- 插件不直接编辑 Antigravity 的 `app_storage.json`、凭据或私有会话存储。
 
 ### 更新
 
@@ -192,12 +308,22 @@ codex plugin add codex-dynamic-bridge@codex-dynamic-bridge
 
 ### 卸载
 
+如果启用了 Companion，必须先在仍可使用插件的新 Codex 任务中发送：
+
+```text
+使用 Codex Dynamic Bridge 卸载全局 Companion，我授权此次卸载
+```
+
+确认 Companion 已卸载后，再移除 Codex 插件和 marketplace：
+
 ```powershell
 codex plugin remove codex-dynamic-bridge@codex-dynamic-bridge
 codex plugin marketplace remove codex-dynamic-bridge
 ```
 
-插件的会话链接元数据默认保留在 `$CODEX_HOME/plugins/data/codex-dynamic-bridge/links.json`；未设置 `CODEX_HOME` 时位于 `$HOME/.codex/plugins/data/codex-dynamic-bridge/links.json`。需要完全清理时，在确认路径无误后手动删除该文件。
+卸载结果若为 `restartRequired: true`，说明旧 Sidecar 可能仍在当前 Antigravity 进程内运行；完全退出所有 Antigravity 进程并重新启动。最终状态应为 `installed: false`、`enabled: false`、`endpointReady: false`，且 `doctor` 的 `sidecar.available` 为 `false`。`endpointFileExists` 可能因保留运行数据仍为 `true`，不代表 Sidecar 可用。
+
+插件的会话链接元数据默认保留在 `$CODEX_HOME/plugins/data/codex-dynamic-bridge/links.json`；未设置 `CODEX_HOME` 时位于 `$HOME/.codex/plugins/data/codex-dynamic-bridge/links.json`。Companion 运行数据默认保留在 `$HOME/.gemini/antigravity/sidecar_data/codex-dynamic-bridge/codex-bridge/`。需要完全清理时，确认路径及计划任务均无误后再手动删除这些数据。
 
 ### 故障排查
 
@@ -260,7 +386,12 @@ python -m bridge.self_test
 |   |-- bridge/
 |   |   |-- cli.py
 |   |   |-- control.py
+|   |   |-- runtime.py
+|   |   |-- state.py
 |   |   `-- self_test.py
+|   |-- companion/
+|   |   |-- install.py
+|   |   `-- antigravity-plugin/
 |   |-- skills/codex-dynamic-bridge/SKILL.md
 |   `-- README.md
 |-- LICENSE
@@ -273,6 +404,8 @@ python -m bridge.self_test
 Set-Location .\plugins\codex-dynamic-bridge
 python -m compileall -q bridge
 python -m bridge.self_test
+Set-Location .\companion\antigravity-plugin\sidecars\codex-bridge
+python .\self_test.py
 ```
 
 提交 Issue 时请附上 Codex 版本、Python 版本、Antigravity 版本、执行的命令和完整错误信息，并先移除会话正文、令牌和本机路径等敏感内容。
@@ -327,6 +460,13 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - Discover locally exposed Antigravity sessions and their conversation IDs.
 - Inspect focus, load state, viewport, and the active element.
 - Read the complete visible text of the current session or a selected element.
+- Capture accessibility snapshots and target controls by role and accessible name.
+- Create, continue, wait for, switch, rename, fork, or cancel conversations.
+- List and switch models, set reasoning effort, and inspect model usage.
+- Open or create projects and read or update global/project settings.
+- Read artifacts, approve plans, and summarize tool and subagent activity.
+- Receive Hook events and run schedules through the Companion Sidecar.
+- Maintain bidirectional Codex-task to Antigravity-conversation mappings.
 - Wait for an element to become attached, detached, visible, or hidden.
 - Click, fill, or press keys only after the user explicitly authorizes the specific action.
 - Save, list, merge, and remove local session-link metadata.
@@ -341,6 +481,24 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - Python 3.10 or newer.
 - Metadata commands use only the Python standard library.
 - `control` commands require Python Playwright, but no separate Chromium installation.
+- Structured headless conversations may optionally use the official `agy` CLI.
+- Events, completion waits, and schedules may optionally use the included Antigravity Companion Sidecar.
+
+### Capability tiers
+
+Start with:
+
+```powershell
+python -m bridge.cli doctor
+```
+
+The plugin detects three backends:
+
+1. **Desktop CDP**: reads, accessibility snapshots, and semantic desktop control.
+2. **Antigravity CLI (`agy`)**: creates or continues headless conversations by project, model, and effort with structured JSON output.
+3. **Companion Sidecar**: uses official `agentapi` calls, receives Hook completion events, and manages schedules.
+
+When an optional backend is absent, `doctor` reports the missing capability without installing anything. A failed write is never retried automatically through another backend.
 
 ### Install and verify
 
@@ -375,6 +533,12 @@ Use Codex Dynamic Bridge to list currently discoverable Antigravity sessions; do
 
 The expected result is a JSON session list. If Antigravity is not running, expect a clear DevTools port-file error rather than a page mutation.
 
+6. If you need stable events, completion waits, or schedules, send this authorization prompt in the same new task. Codex runs it from the installed plugin location, so you do not need to find its cache directory:
+
+```text
+Use Codex Dynamic Bridge to check the global Companion. If it is not installed, install it once with the default-cli-project project; I authorize this installation.
+```
+
 ### Suggested prompts
 
 ```text
@@ -398,6 +562,89 @@ Read-only requests do not require a CSS selector. When multiple sessions exist, 
 ### Command reference
 
 Run the following development commands from `plugins/codex-dynamic-bridge`. For normal use, ask Codex to invoke the plugin skill instead.
+
+P1-P3 domain commands:
+
+```powershell
+# Capability discovery
+python -m bridge.cli doctor
+
+# Create, continue, and wait; prefer standard input for prompts
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-id <project-id> --model <slug> --effort high --confirm-create
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
+python -m bridge.cli conversation wait --conversation-id <id>
+
+# Desktop conversations, models, and projects
+python -m bridge.cli conversation switch --id <id> --target <title> --confirm-conversation
+python -m bridge.cli conversation rename --id <id> --name <name> --confirm-conversation
+python -m bridge.cli conversation fork --id <id> --project-id <project-id> --confirm-conversation
+python -m bridge.cli conversation cancel --id <id> --confirm-conversation
+python -m bridge.cli model list
+python -m bridge.cli model desktop-list --id <id>
+python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
+python -m bridge.cli project open --id <id> --name <project-name> --confirm-project
+python -m bridge.cli project new --id <id> --confirm-project
+
+# Settings, usage, artifacts, activity, and task mappings
+python -m bridge.cli settings read --id <id>
+python -m bridge.cli settings set --id <id> --label <accessible-label> --value <value> --confirm-settings
+python -m bridge.cli usage --id <id>
+python -m bridge.cli artifact list --conversation-id <id>
+python -m bridge.cli artifact read --conversation-id <id> --path <relative-path>
+python -m bridge.cli artifact proceed --id <id> --confirm-artifact
+python -m bridge.cli activity --conversation-id <id>
+python -m bridge.cli task link --conversation-id <id> --codex-task-id <codex-id> --project-id <project-id>
+
+# Hook events and Sidecar schedules
+python -m bridge.cli event sync
+python -m bridge.cli event list --conversation-id <id>
+Get-Content -Raw .\prompt.txt | python -m bridge.cli schedule create --prompt-stdin --interval-seconds 3600 --confirm-schedule
+python -m bridge.cli schedule list
+python -m bridge.cli schedule remove --schedule-id <id> --confirm-schedule
+```
+
+### Enable the global Companion Sidecar once
+
+You no longer need to install the companion in every Antigravity workspace. For normal use, send this in a new Codex task that has loaded the plugin:
+
+```text
+Use Codex Dynamic Bridge to check the global Companion. If it is not installed, install it once with the default-cli-project project; I authorize this installation.
+```
+
+Codex locates the installed plugin and detects a running Antigravity instance. The installer stages and atomically replaces the Companion under the official global directory `$HOME\.gemini\config\plugins\codex-dynamic-bridge`, and merges only its own Sidecar entry without overwriting other `config.json` fields.
+
+The following CLI is only for development and troubleshooting from a source checkout. Enter the repository's plugin directory first:
+
+```powershell
+Set-Location .\plugins\codex-dynamic-bridge
+python -m bridge.cli companion status
+python -m bridge.cli companion install-global --confirm-install
+```
+
+The Sidecar uses Antigravity's official `agentapi`, binds only to `127.0.0.1`, and generates a random token at every start. It uses Antigravity's documented `default-cli-project` by default; append `--project-id <project-id>` only for another known project. Once configured, every Antigravity workspace shares this global Companion; no repeated plugin copy is needed.
+
+If Antigravity is running, installation returns `restartRequired: true`; when it is stopped, the value is `false`. Finish current work, fully exit every Antigravity process, launch it once, then ask Codex to "check the Codex Dynamic Bridge Companion and doctor status," or run these commands from the source plugin directory:
+
+```powershell
+python -m bridge.cli companion status
+python -m bridge.cli doctor
+```
+
+Success criteria: `companion status` reports `installed`, `enabled`, `endpointReady`, and `antigravityRunning` as `true`, with the expected `projectId`; `doctor` reports `sidecar.available: true`. After at least one Antigravity task completes, send this read-only prompt in Codex. The Hook path is verified only when recent events are returned:
+
+```text
+Use Codex Dynamic Bridge to sync Sidecar Hook events and list the latest 10; do not modify the Antigravity conversation.
+```
+
+This uses Antigravity's official global plugin discovery instead of version-sensitive hot injection into Electron, and it never closes or restarts Antigravity automatically. The installer generates an official-format `hooks.json`; event delivery fails open and never blocks Antigravity. To remove it, first tell Codex, "Use Codex Dynamic Bridge to uninstall the global Companion; I authorize this uninstall," or run this from the source plugin directory:
+
+```powershell
+python -m bridge.cli companion uninstall-global --confirm-uninstall
+```
+
+Uninstall removes only this plugin directory and the `codex-dynamic-bridge/codex-bridge` entry, preserving every other Antigravity setting and Sidecar.
+
+Sidecar runtime data lives under `$HOME\.gemini\antigravity\sidecar_data\codex-dynamic-bridge\codex-bridge\`. Schedule prompts remain in `data\schedules.json` so they can run repeatedly, but model response bodies are never written there. `uninstall-global` retains this runtime data by default. For complete cleanup, first confirm that no schedule is needed, verify the path, and manually remove that `codex-bridge` directory.
 
 ```powershell
 # Discover sessions
@@ -443,13 +690,15 @@ python -m bridge.cli sync --source .\external-links.json
 
 ### Permissions and safety boundaries
 
-- `discover`, `inspect`, `read`, `get`, and `wait` are read-only operations.
+- `doctor`, `discover`, `inspect`, `read`, `snapshot`, `get`, `wait`, settings reads, events, activity, and artifact listings are read-only operations.
 - When the user explicitly asks to read, summarize, or inspect session content, the plugin may read the complete visible text of the selected session without requiring another selector.
 - `click`, `fill`, and `press` may use `--confirm-control` only after the user authorizes that specific action.
+- Conversations, models, projects, settings, artifacts, and schedules use separate `--confirm-create/send/conversation/model/project/settings/artifact/schedule` flags; authorization is not interchangeable.
 - The plugin does not expose arbitrary JavaScript, arbitrary navigation, page closing, file upload, or download commands.
 - It only connects to Antigravity sessions on `127.0.0.1`, `localhost`, or `::1`.
 - An error from a mutating command does not prove that the page remained unchanged, so the plugin never retries write actions automatically.
 - The plugin does not proactively read unrelated sessions, account credentials, or model-internal state.
+- The plugin never edits Antigravity's internal `app_storage.json`, credentials, or private session storage directly.
 
 ### Update
 
@@ -463,12 +712,22 @@ Removing and reinstalling ensures that Codex uses the refreshed marketplace snap
 
 ### Uninstall
 
+If Companion was enabled, first send this in a new Codex task while the plugin is still available:
+
+```text
+Use Codex Dynamic Bridge to uninstall the global Companion; I authorize this uninstall.
+```
+
+After confirming that Companion is removed, uninstall the Codex plugin and marketplace:
+
 ```powershell
 codex plugin remove codex-dynamic-bridge@codex-dynamic-bridge
 codex plugin marketplace remove codex-dynamic-bridge
 ```
 
-Session-link metadata is retained by default at `$CODEX_HOME/plugins/data/codex-dynamic-bridge/links.json`, or at `$HOME/.codex/plugins/data/codex-dynamic-bridge/links.json` when `CODEX_HOME` is unset. For a complete cleanup, manually remove that file only after verifying the path.
+If uninstall returns `restartRequired: true`, the old Sidecar may still be alive inside the current Antigravity process. Fully exit every Antigravity process and launch it again. The final state must show `installed: false`, `enabled: false`, and `endpointReady: false`; `doctor` must report `sidecar.available: false`. A retained runtime-data file may leave `endpointFileExists: true`, which does not mean the Sidecar is available.
+
+Session-link metadata is retained by default at `$CODEX_HOME/plugins/data/codex-dynamic-bridge/links.json`, or at `$HOME/.codex/plugins/data/codex-dynamic-bridge/links.json` when `CODEX_HOME` is unset. Companion runtime data remains under `$HOME/.gemini/antigravity/sidecar_data/codex-dynamic-bridge/codex-bridge/`. For complete cleanup, verify these paths and confirm that no schedule is needed before removing the data manually.
 
 ### Troubleshooting
 
@@ -531,7 +790,12 @@ Repository layout:
 |   |-- bridge/
 |   |   |-- cli.py
 |   |   |-- control.py
+|   |   |-- runtime.py
+|   |   |-- state.py
 |   |   `-- self_test.py
+|   |-- companion/
+|   |   |-- install.py
+|   |   `-- antigravity-plugin/
 |   |-- skills/codex-dynamic-bridge/SKILL.md
 |   `-- README.md
 |-- LICENSE
@@ -544,6 +808,8 @@ Run checks:
 Set-Location .\plugins\codex-dynamic-bridge
 python -m compileall -q bridge
 python -m bridge.self_test
+Set-Location .\companion\antigravity-plugin\sidecars\codex-bridge
+python .\self_test.py
 ```
 
 When opening an issue, include the Codex version, Python version, Antigravity version, command, and complete error. Remove session content, tokens, and sensitive local paths first.

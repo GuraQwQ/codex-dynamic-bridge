@@ -1,0 +1,9 @@
+{
+  "display_name": "Codex Dynamic Bridge",
+  "description": "仅在本机回环地址提供经过令牌认证的 Antigravity agentapi 桥接。",
+  "command": "python",
+  "args": [
+    "server.py"
+  ],
+  "restart_policy": "on-failure"
+}
