@@ -1,0 +1,20 @@
+{
+  "name": "codex-dynamic-bridge",
+  "interface": {
+    "displayName": "Codex Dynamic Bridge"
+  },
+  "plugins": [
+    {
+      "name": "codex-dynamic-bridge",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-dynamic-bridge"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

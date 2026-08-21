@@ -1,0 +1,40 @@
+{
+  "name": "codex-dynamic-bridge",
+  "version": "0.1.0",
+  "description": "通过本机 CDP 发现、读取并在明确授权后控制 Antigravity 会话。",
+  "author": {
+    "name": "GuraQwQ",
+    "url": "https://github.com/GuraQwQ"
+  },
+  "homepage": "https://github.com/GuraQwQ/codex-dynamic-bridge#readme",
+  "repository": "https://github.com/GuraQwQ/codex-dynamic-bridge",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "antigravity",
+    "agent",
+    "codex-plugin",
+    "cdp",
+    "playwright"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Dynamic Bridge",
+    "shortDescription": "发现、读取并明确控制 Antigravity 会话",
+    "longDescription": "通过 Antigravity 的本地 DevTools 接口发现会话、读取完整可见文本、维护链接快照，并在用户明确授权后通过 CDP 点击、填充和按键。",
+    "developerName": "GuraQwQ",
+    "category": "Productivity",
+    "capabilities": [
+      "Antigravity 会话发现",
+      "会话正文只读提取",
+      "本地链接合并",
+      "明确授权的 CDP 页面控制"
+    ],
+    "websiteURL": "https://github.com/GuraQwQ/codex-dynamic-bridge",
+    "defaultPrompt": [
+      "列出 Antigravity 当前可发现的会话",
+      "读取并总结 Antigravity 当前聚焦会话",
+      "在我确认后操作 Antigravity 页面"
+    ]
+  }
+}
