@@ -14,13 +14,24 @@ class RuntimeBridgeError(RuntimeError):
 
 
 def find_agy(env=None):
+    uses_process_environment = env is None
     env = os.environ if env is None else env
     override = env.get("CODEX_DYNAMIC_BRIDGE_AGY")
+    codex_home_value = env.get("CODEX_HOME")
+    codex_home = Path(
+        codex_home_value
+        or (Path.home() / ".codex" if uses_process_environment else "__no_codex_home__")
+    )
+    plugin_root = Path(__file__).resolve().parents[1]
+    bundled_name = "agy.exe" if os.name == "nt" else "agy"
     candidates = [
         override,
         shutil.which("agy"),
+        str(codex_home / "tools" / "agy" / bundled_name),
         str(Path(env.get("LOCALAPPDATA", "")) / "agy" / "bin" / "agy.exe"),
     ]
+    if uses_process_environment and not codex_home_value:
+        candidates.append(str(plugin_root / "tools" / "agy" / bundled_name))
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return str(Path(candidate))
@@ -183,6 +194,34 @@ class SidecarClient:
                     return event
             if time.monotonic() >= deadline:
                 raise RuntimeBridgeError(f"等待 Sidecar 会话完成超时: {conversation_id}")
+            time.sleep(poll_seconds)
+
+    def wait_for_event(
+        self,
+        conversation_id,
+        kind,
+        timeout_seconds=30,
+        poll_seconds=0.5,
+        tool_name=None,
+        approval_state=None,
+        after=None,
+    ):
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            for event in reversed(self.list_events(conversation_id)):
+                if event.get("kind") != kind:
+                    continue
+                if tool_name and event.get("toolName") != tool_name:
+                    continue
+                if approval_state and event.get("approvalState") != approval_state:
+                    continue
+                if after and event.get("observedAt", "") <= after:
+                    continue
+                return event
+            if time.monotonic() >= deadline:
+                raise RuntimeBridgeError(
+                    f"等待 Sidecar 事件超时: {conversation_id} / {kind}"
+                )
             time.sleep(poll_seconds)
 
     def list_schedules(self):

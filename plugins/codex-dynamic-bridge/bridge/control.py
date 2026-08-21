@@ -1,4 +1,4 @@
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 MUTATING_ACTIONS = {
@@ -26,9 +26,18 @@ def conversation_id_from_url(url):
     return path_parts[1]
 
 
+def trusted_page_url(url):
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+
+
 def page_info(page):
     return page.evaluate(
-        """() => {
+        r"""() => {
             const active = document.activeElement;
             return {
                 title: document.title,
@@ -228,6 +237,139 @@ def click_first_named(page, names, timeout_ms):
     raise ControlError(f"未找到唯一入口: {' / '.join(names)}")
 
 
+def approval_dialog_snapshot(page):
+    """只读取当前权限对话框；内容不写入事件或任务账本。"""
+    return page.evaluate(
+        r"""() => {
+            const markers = [
+                '是否允许运行此命令',
+                '允许运行此命令',
+                'Allow this command',
+                'permission to run this command'
+            ];
+            const visible = element => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0
+                    && style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const containsMarker = element => {
+                const text = String(element.innerText || element.textContent || '');
+                return markers.some(marker => text.includes(marker));
+            };
+            let target = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')]
+                .find(element => visible(element) && containsMarker(element));
+            if (!target) {
+                const leaves = [...document.querySelectorAll('body *')].filter(element => {
+                    if (!visible(element) || !containsMarker(element)) return false;
+                    return ![...element.children].some(child => containsMarker(child));
+                });
+                for (const leaf of leaves) {
+                    let current = leaf;
+                    for (let depth = 0; current && depth < 8; depth += 1) {
+                        if (current.querySelectorAll('button').length >= 1) {
+                            target = current;
+                            break;
+                        }
+                        current = current.parentElement;
+                    }
+                    if (target) break;
+                }
+            }
+            if (!target) return {open: false, text: '', textLength: 0, buttons: []};
+            const rawText = String(target.innerText || target.textContent || '').trim();
+            const buttons = [...target.querySelectorAll('button')]
+                .filter(visible)
+                .map(button => String(
+                    button.getAttribute('aria-label')
+                    || button.getAttribute('title')
+                    || button.innerText
+                    || button.textContent
+                    || ''
+                ).trim())
+                .filter(Boolean);
+            const options = [...target.querySelectorAll('input[type="radio"]')]
+                .filter(visible)
+                .map(input => {
+                    const explicit = input.id
+                        ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`)
+                        : null;
+                    const label = explicit || input.closest('label') || input.parentElement;
+                    const name = String(label?.innerText || label?.textContent || '').trim();
+                    const denied = /(^|\s)(no|deny|denied)(\s|$)|否|拒绝|不允许/i.test(name);
+                    return {name, decision: denied ? 'deny' : 'allow', checked: input.checked};
+                })
+                .filter(option => option.name);
+            return {
+                open: true,
+                text: rawText.slice(0, 4000),
+                textLength: rawText.length,
+                buttons,
+                options
+            };
+        }"""
+    )
+
+
+def queued_send_now_target(page, prompt):
+    buttons = page.get_by_role("button", name="Send Now", exact=True)
+    matches = []
+    for index in range(buttons.count()):
+        button = buttons.nth(index)
+        if button.evaluate(
+            """(candidate, expected) => {
+                let current = candidate.parentElement;
+                for (let depth = 0; current && depth < 8; depth += 1) {
+                    const text = String(current.innerText || current.textContent || '');
+                    if (text.includes(expected)) return true;
+                    if (depth > 0 && /Queued Messages|排队消息/.test(text)) return false;
+                    current = current.parentElement;
+                }
+                return false;
+            }""",
+            prompt,
+        ):
+            matches.append(button)
+    if len(matches) != 1:
+        raise ControlError(
+            f"无法把补充内容关联到唯一 Send Now 按钮，实际候选 {len(matches)} 个"
+        )
+    return matches[0]
+
+
+def review_tab_target(page, timeout_ms):
+    review = page.get_by_role("button", name="Review tab", exact=True)
+    if review.count() == 0:
+        toggles = []
+        for name in ("切换辅助面板", "Toggle Auxiliary Panel"):
+            candidate = page.get_by_role("button", name=name, exact=True)
+            if candidate.count() == 1:
+                toggles.append(candidate.nth(0))
+        if len(toggles) != 1:
+            raise ControlError("Review 页不可见，且无法唯一定位辅助面板开关")
+        toggle = toggles[0]
+        if toggle.get_attribute("aria-expanded") != "true":
+            toggle.click(timeout=timeout_ms)
+        review.nth(0).wait_for(state="visible", timeout=timeout_ms)
+    target, _, _ = resolve_role_target(
+        page, "button", "Review tab", exact=True, nth=None
+    )
+    return target
+
+
+def review_region_target(page):
+    matches = []
+    for name in ("评审", "Review"):
+        region = page.get_by_role("region", name=name, exact=True)
+        for index in range(region.count()):
+            target = region.nth(index)
+            if target.is_visible():
+                matches.append(target)
+    if len(matches) != 1:
+        raise ControlError(f"Review 内容区域必须唯一可见，实际候选 {len(matches)} 个")
+    return matches[0]
+
+
 def open_model_menu(page, timeout_ms, trigger_name=None):
     if trigger_name:
         target, _, _ = resolve_role_target(
@@ -256,7 +398,56 @@ def perform_workflow(page, args):
     before = page_info(page)
     detail = {}
     if action == "conversation-new":
-        page.keyboard.press("Control+N")
+        previous_id = conversation_id_from_url(page.url)
+        new_button, _, _ = resolve_role_target(
+            page,
+            "button",
+            "New Conversation",
+            exact=True,
+        )
+        new_button.click(timeout=args.timeout_ms)
+        page.wait_for_url(
+            lambda url: trusted_page_url(url) and conversation_id_from_url(url) is None,
+            timeout=args.timeout_ms,
+        )
+        input_target, _, _ = resolve_role_target(
+            page,
+            "combobox",
+            "Message input",
+            exact=True,
+        )
+        input_target.fill(args.prompt, timeout=args.timeout_ms)
+        send_button, _, _ = resolve_role_target(
+            page,
+            "button",
+            "Send message",
+            exact=True,
+        )
+        send_button.click(timeout=args.timeout_ms)
+        page.wait_for_url(
+            lambda url: (
+                conversation_id_from_url(url) is not None
+                and conversation_id_from_url(url) != previous_id
+            ),
+            timeout=args.timeout_ms,
+        )
+        detail["conversationId"] = conversation_id_from_url(page.url)
+        detail["promptLength"] = len(args.prompt)
+    elif action == "conversation-send-now":
+        input_target = message_input(page)
+        input_target.fill(args.prompt, timeout=args.timeout_ms)
+        input_target.press("Enter", timeout=args.timeout_ms)
+        page.wait_for_timeout(args.settle_ms)
+        send_now = queued_send_now_target(page, args.prompt)
+        send_now.click(timeout=args.timeout_ms)
+        page.wait_for_timeout(args.settle_ms)
+        try:
+            queued_send_now_target(page, args.prompt)
+        except ControlError:
+            pass
+        else:
+            raise ControlError("Send Now 已点击，但补充内容仍在队列中；不要自动重试")
+        detail.update({"promptLength": len(args.prompt), "sentImmediately": True})
     elif action == "conversation-switch":
         page.keyboard.press("Control+K")
         page.wait_for_timeout(args.settle_ms)
@@ -277,8 +468,9 @@ def perform_workflow(page, args):
             page, args.timeout_ms, getattr(args, "trigger_name", None)
         )
         page.wait_for_timeout(args.settle_ms)
+        body, _, _ = resolve_target(page, "body", nth=None)
         detail["snapshot"] = snapshot_target(
-            page.locator("body"), args.timeout_ms, args.max_controls
+            body, args.timeout_ms, args.max_controls
         )
         page.keyboard.press("Escape")
     elif action == "model-set":
@@ -341,6 +533,57 @@ def perform_workflow(page, args):
         detail["button"] = click_first_named(
             page, ("Proceed", "继续", "执行"), args.timeout_ms
         )
+    elif action == "approval-inspect":
+        detail["approval"] = approval_dialog_snapshot(page)
+    elif action == "review-changes":
+        query = parse_qs(urlparse(page.url).query)
+        review_tab = review_tab_target(page, args.timeout_ms)
+        if query.get("tab", [None])[0] != "review":
+            review_tab.click(timeout=args.timeout_ms)
+            page.wait_for_timeout(args.settle_ms)
+        review_region = review_region_target(page)
+        detail["content"] = read_target_text(review_region, args.timeout_ms)
+        detail["snapshot"] = snapshot_target(
+            review_region, args.timeout_ms, args.max_controls
+        )
+    elif action == "approval-respond":
+        before_approval = approval_dialog_snapshot(page)
+        if not before_approval.get("open"):
+            raise ControlError("当前会话没有可见的命令审批对话框")
+        matching_options = [
+            option
+            for option in before_approval.get("options", [])
+            if option.get("name") == args.option_name
+            and option.get("decision") == args.decision
+        ]
+        if len(matching_options) != 1:
+            raise ControlError("审批选项与指定 decision 不唯一匹配")
+        option = page.get_by_text(args.option_name, exact=True)
+        if option.count() != 1:
+            raise ControlError("审批选项文本必须唯一匹配")
+        option.nth(0).click(timeout=args.timeout_ms)
+        if args.button_name not in before_approval.get("buttons", []):
+            raise ControlError(
+                f"审批按钮不在当前对话框中: {args.button_name}; "
+                f"可见按钮: {before_approval.get('buttons', [])}"
+            )
+        target, _, _ = resolve_role_target(
+            page, "button", args.button_name, exact=True, nth=None
+        )
+        target.click(timeout=args.timeout_ms)
+        page.wait_for_timeout(args.settle_ms)
+        after_approval = approval_dialog_snapshot(page)
+        detail.update(
+            {
+                "decision": args.decision,
+                "option": args.option_name,
+                "button": args.button_name,
+                "before": before_approval,
+                "after": after_approval,
+            }
+        )
+        if after_approval.get("open"):
+            raise ControlError("审批按钮已点击，但对话框仍可见；不要自动重试")
     else:
         raise ControlError(f"不支持的桌面工作流: {action}")
 
@@ -465,7 +708,7 @@ def perform_action(page, args):
     }
 
 
-def execute_control(port, conversation_id, args):
+def execute_control(port, conversation_id, args, page_url=None):
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -480,15 +723,22 @@ def execute_control(port, conversation_id, args):
         playwright = sync_playwright().start()
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         pages = [page for context in browser.contexts for page in context.pages]
-        matches = [
-            page
-            for page in pages
-            if conversation_id_from_url(page.url) == conversation_id
-        ]
+        if page_url is not None:
+            if not trusted_page_url(page_url):
+                raise ControlError(f"拒绝非 Antigravity 回环页面目标: {page_url}")
+            matches = [page for page in pages if page.url == page_url]
+            target_description = page_url
+        else:
+            matches = [
+                page
+                for page in pages
+                if conversation_id_from_url(page.url) == conversation_id
+            ]
+            target_description = conversation_id
         if not matches:
-            raise ControlError(f"CDP 中未找到指定会话页面: {conversation_id}")
+            raise ControlError(f"CDP 中未找到指定 Antigravity 页面: {target_description}")
         if len(matches) > 1:
-            raise ControlError(f"CDP 中出现多个同 ID 会话页面: {conversation_id}")
+            raise ControlError(f"CDP 中出现多个相同页面目标: {target_description}")
         page = matches[0]
         page.set_default_timeout(args.timeout_ms)
         return perform_action(page, args)

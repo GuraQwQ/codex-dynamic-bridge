@@ -16,6 +16,7 @@ from bridge.runtime import (
     find_agy,
     runtime_summary,
 )
+from bridge.setup import SetupError, default_agy_install_dir, ensure_agy
 from bridge.companion import (
     CompanionError,
     DEFAULT_PROJECT_ID,
@@ -39,6 +40,13 @@ ALLOWED_URL_SCHEMES = {"http", "https", "codex"}
 
 class BridgeError(RuntimeError):
     """可直接展示给用户的桥接错误。"""
+
+
+def configure_standard_streams():
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="strict")
 
 
 def default_links_path():
@@ -277,10 +285,72 @@ def discover_sessions(pages=None):
     return sessions
 
 
+def discover_app_pages(pages=None):
+    pages = fetch_antigravity_pages() if pages is None else pages
+    discovered = []
+    seen = set()
+    for page in pages:
+        if not isinstance(page, dict) or page.get("type") != "page":
+            continue
+        devtools_id = page.get("id")
+        url = page.get("url", "")
+        title = page.get("title", "")
+        if not isinstance(devtools_id, str) or not devtools_id:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            continue
+        conversation_id = conversation_id_from_url(url)
+        is_shell = parsed.path in {"", "/"} and title.strip() == "Antigravity"
+        if not conversation_id and not is_shell:
+            continue
+        if devtools_id in seen:
+            continue
+        seen.add(devtools_id)
+        discovered.append(
+            {
+                "kind": "conversation" if conversation_id else "shell",
+                "conversationId": conversation_id,
+                "devtoolsId": devtools_id,
+                "title": title or "Antigravity",
+                "url": url,
+            }
+        )
+    return discovered
+
+
+def select_app_page(pages, target_id=None):
+    if target_id:
+        matches = [
+            page
+            for page in pages
+            if target_id in {page["devtoolsId"], page.get("conversationId")}
+        ]
+        if len(matches) != 1:
+            raise BridgeError(f"未找到唯一 Antigravity 页面目标: {target_id}")
+        return matches[0]
+    if not pages:
+        raise BridgeError("未找到 Antigravity 客户端页面")
+    if len(pages) > 1:
+        choices = "、".join(page["devtoolsId"] for page in pages)
+        raise BridgeError(f"发现多个 Antigravity 页面，无法选择 bootstrap 目标: {choices}")
+    return pages[0]
+
+
 def discover_links(_):
     sessions = discover_sessions()
     print(json.dumps(sessions, ensure_ascii=False, indent=2))
     return sessions
+
+
+def discover_pages(_):
+    pages = discover_app_pages()
+    print(json.dumps(pages, ensure_ascii=False, indent=2))
+    return pages
 
 
 def select_sessions(sessions, conversation_id=None, all_sessions=False):
@@ -358,11 +428,15 @@ def doctor_command(_):
         result["companion"] = {"statusError": str(exc)}
     try:
         port = read_antigravity_port()
-        sessions = discover_sessions()
+        pages = fetch_antigravity_pages()
+        sessions = discover_sessions(pages)
+        app_pages = discover_app_pages(pages)
         result["desktop"] = {
             "available": True,
             "port": port,
             "sessions": len(sessions),
+            "pages": len(app_pages),
+            "bootstrapTargets": sum(page["kind"] == "shell" for page in app_pages),
         }
     except BridgeError as exc:
         result["desktop"] = {"available": False, "error": str(exc)}
@@ -512,9 +586,62 @@ def event_command(args):
         return print_json({"event": event, "task": task})
     if args.event_action == "list":
         return print_json(store.list(args.conversation_id, limit=args.limit))
+    if args.event_action == "wait-approval":
+        after = format_timestamp(parse_timestamp(args.after)) if args.after else None
+        if args.backend in {"auto", "sidecar"}:
+            sidecar = SidecarClient()
+            try:
+                event = sidecar.wait_for_event(
+                    args.conversation_id,
+                    "PreToolUse",
+                    timeout_seconds=args.timeout_seconds,
+                    tool_name=args.tool_name,
+                    approval_state="requested",
+                    after=after,
+                )
+            except RuntimeBridgeError:
+                if args.backend == "sidecar":
+                    raise
+            else:
+                store.import_events([event])
+                tasks.sync_event(event)
+                return print_json(event)
+        return print_json(
+            store.wait_approval(
+                args.conversation_id,
+                timeout_seconds=args.timeout_seconds,
+                tool_name=args.tool_name,
+                after=after,
+            )
+        )
     return print_json(
         store.wait(args.conversation_id, timeout_seconds=args.timeout_seconds)
     )
+
+
+def approval_command(args):
+    if args.approval_action == "inspect":
+        return run_desktop_workflow(args, "approval-inspect")
+    if not args.confirm_approval:
+        raise BridgeError("响应命令审批会修改 Antigravity 状态；请传入 --confirm-approval")
+
+    observed_at = format_timestamp(parse_timestamp(args.event_observed_at))
+    events = SidecarClient().list_events(args.id)
+    matching = [
+        event
+        for event in events
+        if event.get("kind") == "PreToolUse"
+        and event.get("approvalState") == "requested"
+        and event.get("toolName") == args.tool_name
+        and event.get("observedAt") == observed_at
+    ]
+    if len(matching) != 1:
+        raise BridgeError("找不到与本次响应精确对应的唯一审批事件，拒绝点击")
+    return run_desktop_workflow(args, "approval-respond")
+
+
+def review_command(args):
+    return run_desktop_workflow(args, "review-changes")
 
 
 def schedule_command(args):
@@ -551,6 +678,28 @@ def companion_command(args):
     if not args.confirm_uninstall:
         raise BridgeError("卸载会删除全局 Companion；请传入 --confirm-uninstall")
     return print_json(uninstall_companion_global())
+
+
+def setup_command(args):
+    if args.setup_action == "status":
+        return print_json(
+            {
+                "agy": {
+                    "available": bool(find_agy()),
+                    "path": find_agy(),
+                    "defaultInstallDir": str(default_agy_install_dir()),
+                },
+                "companion": companion_status(),
+            }
+        )
+    if not args.confirm_setup:
+        raise BridgeError("完整能力装载会安装 agy 并修改 Antigravity 配置；请传入 --confirm-setup")
+    agy = ensure_agy(
+        install_dir=args.agy_dir,
+        allow_system_drive=args.allow_system_drive,
+    )
+    companion = install_companion_global(args.project_id)
+    return print_json({"agy": agy, "companion": companion})
 
 
 def task_command(args):
@@ -595,11 +744,42 @@ def run_desktop_workflow(args, workflow_action):
     return print_json(result)
 
 
+def run_new_conversation_workflow(args):
+    from bridge.control import ControlError, execute_control
+
+    args.control_action = "workflow"
+    args.workflow_action = "conversation-new"
+    args.prompt = prompt_from_args(args)
+    page = select_app_page(discover_app_pages(), args.id)
+    try:
+        result = execute_control(
+            read_antigravity_port(),
+            page.get("conversationId"),
+            args,
+            page_url=page["url"],
+        )
+    except ControlError as exc:
+        raise BridgeError(str(exc)) from exc
+    conversation_id = result.get("detail", {}).get("conversationId")
+    if not conversation_id:
+        raise BridgeError("新建会话动作完成，但未观察到新的 conversation ID；不要自动重试")
+    result["conversationId"] = conversation_id
+    result["sourceDevtoolsId"] = page["devtoolsId"]
+    result["bootstrappedFromShell"] = page["kind"] == "shell"
+    return print_json(result)
+
+
 def desktop_conversation_command(args):
+    if args.conversation_action == "send-now":
+        if not args.confirm_send:
+            raise BridgeError("立即发送补充会中断当前轨迹；请传入 --confirm-send")
+        args.prompt = prompt_from_args(args)
+        return run_desktop_workflow(args, "conversation-send-now")
     if not args.confirm_conversation:
         raise BridgeError("该会话动作会改变 Antigravity 页面或会话；请传入 --confirm-conversation")
+    if args.conversation_action == "open-new":
+        return run_new_conversation_workflow(args)
     mapping = {
-        "open-new": "conversation-new",
         "switch": "conversation-switch",
         "rename": "conversation-rename",
         "fork": "conversation-fork",
@@ -642,8 +822,12 @@ def artifact_proceed_command(args):
     return run_desktop_workflow(args, "artifact-proceed")
 
 
-def add_desktop_workflow_arguments(parser):
-    parser.add_argument("--id", required=True, help="会话 conversationId 或 DevTools id")
+def add_desktop_workflow_arguments(parser, require_id=True):
+    parser.add_argument(
+        "--id",
+        required=require_id,
+        help="会话 conversationId 或 DevTools id",
+    )
     parser.add_argument(
         "--timeout-ms",
         type=timeout_milliseconds,
@@ -770,6 +954,11 @@ def build_parser():
     discover_parser = subparsers.add_parser("discover", help="只读列出 Antigravity 会话候选")
     discover_parser.set_defaults(func=discover_links)
 
+    discover_pages_parser = subparsers.add_parser(
+        "discover-pages", help="只读列出可信 Antigravity 会话页与客户端外壳页"
+    )
+    discover_pages_parser.set_defaults(func=discover_pages)
+
     live_parser = subparsers.add_parser("live", help="读取并保存 Antigravity 会话元数据")
     selection = live_parser.add_mutually_exclusive_group()
     selection.add_argument("--id", help="会话 conversationId 或 DevTools id")
@@ -807,6 +996,18 @@ def build_parser():
     send_conversation_parser.add_argument("--confirm-send", action="store_true")
     send_conversation_parser.set_defaults(func=conversation_command)
 
+    send_now_conversation_parser = conversation_subparsers.add_parser(
+        "send-now", help="将补充内容立即注入正在执行的桌面会话"
+    )
+    add_desktop_workflow_arguments(send_now_conversation_parser)
+    send_now_prompt = send_now_conversation_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    send_now_prompt.add_argument("--prompt")
+    send_now_prompt.add_argument("--prompt-stdin", action="store_true")
+    send_now_conversation_parser.add_argument("--confirm-send", action="store_true")
+    send_now_conversation_parser.set_defaults(func=desktop_conversation_command)
+
     wait_conversation_parser = conversation_subparsers.add_parser("wait", help="等待 Hook 报告会话完全空闲")
     wait_conversation_parser.add_argument("--conversation-id", required=True)
     wait_conversation_parser.add_argument("--backend", choices=("auto", "local", "sidecar"), default="auto")
@@ -814,7 +1015,10 @@ def build_parser():
     wait_conversation_parser.set_defaults(func=conversation_command)
 
     open_new_parser = conversation_subparsers.add_parser("open-new", help="在桌面打开新会话")
-    add_desktop_workflow_arguments(open_new_parser)
+    add_desktop_workflow_arguments(open_new_parser, require_id=False)
+    open_new_prompt = open_new_parser.add_mutually_exclusive_group(required=True)
+    open_new_prompt.add_argument("--prompt")
+    open_new_prompt.add_argument("--prompt-stdin", action="store_true")
     open_new_parser.add_argument("--confirm-conversation", action="store_true")
     open_new_parser.set_defaults(func=desktop_conversation_command)
 
@@ -874,6 +1078,19 @@ def build_parser():
     event_wait_parser.add_argument("--conversation-id", required=True)
     event_wait_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=30)
     event_wait_parser.set_defaults(func=event_command)
+    event_wait_approval_parser = event_subparsers.add_parser(
+        "wait-approval", help="阻塞等待 PreToolUse 命令审批请求"
+    )
+    event_wait_approval_parser.add_argument("--conversation-id", required=True)
+    event_wait_approval_parser.add_argument("--tool-name")
+    event_wait_approval_parser.add_argument("--after", help="仅接受此 ISO 8601 时间之后的事件")
+    event_wait_approval_parser.add_argument(
+        "--backend", choices=("auto", "sidecar", "local"), default="auto"
+    )
+    event_wait_approval_parser.add_argument(
+        "--timeout-seconds", type=nonnegative_integer, default=300
+    )
+    event_wait_approval_parser.set_defaults(func=event_command)
     event_sync_parser = event_subparsers.add_parser("sync", help="从 Sidecar 导入并去重事件")
     event_sync_parser.add_argument("--conversation-id")
     event_sync_parser.set_defaults(func=event_command)
@@ -910,6 +1127,29 @@ def build_parser():
     add_desktop_workflow_arguments(artifact_proceed_parser)
     artifact_proceed_parser.add_argument("--confirm-artifact", action="store_true")
     artifact_proceed_parser.set_defaults(func=artifact_proceed_command)
+
+    approval_parser = subparsers.add_parser("approval", help="检查或响应命令审批对话框")
+    approval_subparsers = approval_parser.add_subparsers(
+        dest="approval_action", required=True
+    )
+    approval_inspect_parser = approval_subparsers.add_parser(
+        "inspect", help="只读检查当前审批对话框"
+    )
+    add_desktop_workflow_arguments(approval_inspect_parser)
+    approval_inspect_parser.set_defaults(func=approval_command)
+    approval_respond_parser = approval_subparsers.add_parser(
+        "respond", help="按已观察到的精确按钮响应审批"
+    )
+    add_desktop_workflow_arguments(approval_respond_parser)
+    approval_respond_parser.add_argument(
+        "--decision", required=True, choices=("allow", "deny")
+    )
+    approval_respond_parser.add_argument("--button-name", required=True)
+    approval_respond_parser.add_argument("--option-name", required=True)
+    approval_respond_parser.add_argument("--tool-name", required=True)
+    approval_respond_parser.add_argument("--event-observed-at", required=True)
+    approval_respond_parser.add_argument("--confirm-approval", action="store_true")
+    approval_respond_parser.set_defaults(func=approval_command)
 
     schedule_parser = subparsers.add_parser("schedule", help="管理 Companion Sidecar 定时任务")
     schedule_subparsers = schedule_parser.add_subparsers(dest="schedule_action", required=True)
@@ -971,6 +1211,17 @@ def build_parser():
     activity_parser.add_argument("--conversation-id", required=True)
     activity_parser.set_defaults(func=activity_command)
 
+    review_parser = subparsers.add_parser("review", help="读取 Antigravity 会话归属的文件变更")
+    review_subparsers = review_parser.add_subparsers(dest="review_action", required=True)
+    review_changes_parser = review_subparsers.add_parser(
+        "changes", help="打开 Review 页并返回当前会话的 diff 快照"
+    )
+    add_desktop_workflow_arguments(review_changes_parser)
+    review_changes_parser.add_argument(
+        "--max-controls", type=nonnegative_integer, default=300
+    )
+    review_changes_parser.set_defaults(func=review_command)
+
     companion_parser = subparsers.add_parser("companion", help="一次性全局注册或卸载 Antigravity Companion")
     companion_subparsers = companion_parser.add_subparsers(dest="companion_action", required=True)
     companion_status_parser = companion_subparsers.add_parser("status", help="检查全局 Companion 状态")
@@ -986,6 +1237,19 @@ def build_parser():
     companion_uninstall_parser = companion_subparsers.add_parser("uninstall-global", help="全局卸载 Companion")
     companion_uninstall_parser.add_argument("--confirm-uninstall", action="store_true")
     companion_uninstall_parser.set_defaults(func=companion_command)
+
+    setup_parser = subparsers.add_parser("setup", help="探测或装载 agy 与全局 Companion")
+    setup_subparsers = setup_parser.add_subparsers(dest="setup_action", required=True)
+    setup_status_parser = setup_subparsers.add_parser("status", help="只读检查完整能力状态")
+    setup_status_parser.set_defaults(func=setup_command)
+    setup_ensure_parser = setup_subparsers.add_parser(
+        "ensure", help="使用官方安装器装载 agy 并全局注册 Companion"
+    )
+    setup_ensure_parser.add_argument("--project-id", default=DEFAULT_PROJECT_ID)
+    setup_ensure_parser.add_argument("--agy-dir", type=Path)
+    setup_ensure_parser.add_argument("--allow-system-drive", action="store_true")
+    setup_ensure_parser.add_argument("--confirm-setup", action="store_true")
+    setup_ensure_parser.set_defaults(func=setup_command)
 
     control_parser = subparsers.add_parser("control", help="通过 CDP 明确控制 Antigravity 页面")
     control_subparsers = control_parser.add_subparsers(dest="control_action", required=True)
@@ -1104,13 +1368,21 @@ def build_parser():
 
 def main(argv=None):
     global LINKS_PATH
+    configure_standard_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.store:
         LINKS_PATH = args.store.expanduser()
     try:
         args.func(args)
-    except (BridgeError, CompanionError, RuntimeBridgeError, StateError, OSError) as exc:
+    except (
+        BridgeError,
+        CompanionError,
+        RuntimeBridgeError,
+        SetupError,
+        StateError,
+        OSError,
+    ) as exc:
         parser.exit(1, f"错误: {exc}\n")
     return 0
 

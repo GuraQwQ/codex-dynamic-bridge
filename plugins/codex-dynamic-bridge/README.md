@@ -37,6 +37,16 @@ codex plugin add codex-dynamic-bridge@codex-dynamic-bridge
 使用 Codex Dynamic Bridge 发现并读取 Antigravity 当前会话
 ```
 
+需要完整任务控制能力时，在新任务中一次性发送：
+
+```text
+使用 Codex Dynamic Bridge 完成此任务；如果完整能力尚未装载，自动安装官方 agy 并注册全局 Companion 到 default-cli-project，我授权此次装载
+```
+
+Agent 会先只读检查状态，再执行 `setup ensure --confirm-setup`。`agy` 默认安装到 `$CODEX_HOME\tools\agy`，Windows 通过官方 HTTPS manifest、可信域名和 SHA-512 校验；Companion 是一次性全局注册，不需要逐项目安装，也不会热注入 Electron。
+
+若 `CODEX_HOME` 未设置且工具不能落系统盘，先把它设置到非系统盘，例如 `F:\.codex`。这会迁移 `agy`、下载缓存和 Codex 插件缓存。Companion 必须使用 Antigravity 官方 `$HOME\.gemini\config`；完整装载授权明确包含这项配置写入，禁止写用户主目录的环境不能启用 Companion。
+
 需要页面控制能力时，确保 Codex 所使用的 Python 环境已安装 Playwright：
 
 ```powershell
@@ -62,6 +72,8 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - 打开或创建项目，读取和修改全局/项目设置。
 - 读取产物、批准计划、汇总工具与子 Agent 活动。
 - 通过 Companion Sidecar 接收 Hook 事件并运行计划任务。
+- 运行中将补充信息通过 `Send Now` 立即注入，不等待当前回合结束。
+- 在 `run_command`/`ask_permission` 前接收审批请求并检查当前审批对话框。
 - 维护 Codex 任务与 Antigravity 会话的双向映射。
 - 等待指定元素进入 attached、detached、visible 或 hidden 状态。
 - 在用户明确授权具体动作后点击、填充或发送按键。
@@ -94,7 +106,9 @@ python -m bridge.cli doctor
 2. **Antigravity CLI (`agy`)**：按项目、模型和 effort 新建或继续 headless 会话，并返回结构化 JSON。
 3. **Companion Sidecar**：通过官方 `agentapi` 新建/发送，接收 Hook 完成事件并管理计划任务。
 
-未安装可选后端时，`doctor` 会报告能力缺口，不会自动安装依赖。写操作开始后不会跨后端自动重试。
+需要监工、立即追加补充或第一时间处理审批时，桌面页运行中优先使用 Desktop CDP 的 `open-new`/`send-now`；它们在 UI 接受输入后立即返回，Codex 可马上等待 Hook。Companion/`agy` 适合无需实时干预的 headless 任务。
+
+未安装可选后端时，`doctor` 会报告能力缺口。只有用户明确要求使用本插件完成任务并授权完整装载时，Agent 才可执行 `setup ensure --confirm-setup`；普通发现或只读请求不能触发安装。写操作开始后不会跨后端自动重试。
 
 ### 安装与验证
 
@@ -155,6 +169,14 @@ codex plugin list --json --marketplace codex-dynamic-bridge --available
 
 只读请求不需要提供 CSS 选择器。多个会话同时存在时，插件会检查焦点；若仍无法唯一确定目标，会要求选择 conversation ID。
 
+普通用户无需创建命令示例中的 `prompt.txt` / `supplement.txt`；Agent 直接把用户文本作为 UTF-8 标准输入传给 `--prompt-stdin`。可直接说“无会话时从唯一可信客户端页面新建并发送此任务”或“把此补充立即发送到当前执行，不要排队”，并明确授权本次发送。
+
+### 监工模式
+
+Codex 监工默认先运行 `review changes --id <id>` 读取当前 Antigravity 会话 Review 页归属的文件 diff，再用仓库 `git status` 和 git diff 补全验证，避免混入用户原有或其他会话改动。若 Review diff 与当前实现一致，不要求重复修改。只有 diff 无法解释意图、出现错误/审批或用户明确要求时，才读取相关会话片段；授权反馈后通过 `conversation send-now` 立即追加。
+
+git 工作区优先使用 `event sync` / `event list` 的 `workspacePaths`，Hook 未启用时使用用户明确给出的路径；多个候选时只读核对，不猜测。
+
 ### 命令参考
 
 以下开发命令应在 `plugins/codex-dynamic-bridge` 目录中运行。正常使用时应直接让 Codex 调用插件技能。
@@ -164,6 +186,13 @@ P1-P3 领域命令：
 ```powershell
 # 能力探测
 python -m bridge.cli doctor
+python -m bridge.cli setup status
+python -m bridge.cli setup ensure --confirm-setup
+python -m bridge.cli discover-pages
+
+# 无会话时从唯一可信外壳创建首个任务；运行中立即追加补充
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
+Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 
 # 新建、继续和等待会话；提示词优先通过标准输入传入
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-id <project-id> --model <slug> --effort high --confirm-create
@@ -189,11 +218,16 @@ python -m bridge.cli artifact list --conversation-id <id>
 python -m bridge.cli artifact read --conversation-id <id> --path <relative-path>
 python -m bridge.cli artifact proceed --id <id> --confirm-artifact
 python -m bridge.cli activity --conversation-id <id>
+python -m bridge.cli review changes --id <id>
 python -m bridge.cli task link --conversation-id <id> --codex-task-id <codex-id> --project-id <project-id>
 
 # Hook 事件和 Sidecar 计划任务
 python -m bridge.cli event sync
 python -m bridge.cli event list --conversation-id <id>
+python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_command --timeout-seconds 300
+python -m bridge.cli approval inspect --id <id>
+python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
+python -m bridge.cli approval respond --id <id> --decision deny --option-name <exact-deny-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
 Get-Content -Raw .\prompt.txt | python -m bridge.cli schedule create --prompt-stdin --interval-seconds 3600 --confirm-schedule
 python -m bridge.cli schedule list
 python -m bridge.cli schedule remove --schedule-id <id> --confirm-schedule
@@ -232,7 +266,7 @@ python -m bridge.cli doctor
 使用 Codex Dynamic Bridge 同步 Sidecar Hook 事件并列出最新 10 条；不要修改 Antigravity 会话
 ```
 
-这里使用官方全局插件发现机制，不对 Electron 进程做版本敏感的热注入，也不会自动关闭或重启 Antigravity。安装器会生成符合官方格式的 `hooks.json`；事件上报失败时 fail-open，不会阻断 Antigravity。需要移除时，先在 Codex 中发送“使用 Codex Dynamic Bridge 卸载全局 Companion，我授权此次卸载”，或在源码插件目录运行：
+这里使用官方全局插件发现机制，不对 Electron 进程做版本敏感的热注入，也不会自动关闭或重启 Antigravity。普通生命周期事件上报失败时 fail-open。`PreToolUse` 只匹配 `run_command|ask_permission`，无论上报是否成功都返回官方 `ask`，绝不使用 `allow` 绕过权限；只保存会话 ID、工具名和审批状态等白名单字段，不保存完整命令参数。需要移除时，先在 Codex 中发送“使用 Codex Dynamic Bridge 卸载全局 Companion，我授权此次卸载”，或在源码插件目录运行：
 
 ```powershell
 python -m bridge.cli companion uninstall-global --confirm-uninstall
@@ -290,6 +324,7 @@ python -m bridge.cli sync --source .\external-links.json
 - 用户明确要求读取、总结或检查会话正文时，插件可读取所选会话的完整可见文本，无需额外选择器。
 - `click`、`fill` 和 `press` 只有在用户明确授权当前具体动作后才能使用 `--confirm-control`。
 - 会话、模型、项目、设置、产物和计划任务分别使用 `--confirm-create/send/conversation/model/project/settings/artifact/schedule`，授权不可互换。
+- 审批响应必须绑定唯一事件、当前对话框的精确选项和提交按钮以及 `--confirm-approval`；没有用户对当前可见命令的明确授权时只能通知，不能批准。
 - 插件不提供任意 JavaScript、任意导航、关闭页面、文件上传或下载命令。
 - 插件只连接 `127.0.0.1`、`localhost` 或 `::1` 上的 Antigravity 会话。
 - 页面修改命令返回错误并不能证明页面完全没有发生变化，因此插件不会自动重试写操作。
@@ -359,6 +394,10 @@ python -c "import playwright; print('Playwright OK')"
 **发现多个会话**
 
 先运行 `discover`，再对候选会话运行 `control inspect`。选择唯一 `hasFocus: true` 的会话，或显式传入 conversation ID。
+
+**客户端运行但没有会话 / 补充消息一直排队 / 收不到审批事件**
+
+无会话时运行 `discover-pages` 并从唯一可信外壳执行带提示词的 `conversation open-new`。会话运行中使用 `conversation send-now`，它按正文关联 `Send Now` 并验证队列项消失。审批链路需先全局安装 Companion 并重启一次 Antigravity；投递任务后主动运行 `event wait-approval`。
 
 **选择器不唯一**
 
@@ -441,6 +480,16 @@ Start a new Codex task after installation, then ask:
 Use Codex Dynamic Bridge to discover and read the current Antigravity session.
 ```
 
+For full task control, authorize one-time setup in the new task:
+
+```text
+Use Codex Dynamic Bridge to complete this task. If full capabilities are not loaded, automatically install the official agy and register the global Companion for default-cli-project; I authorize this setup.
+```
+
+The agent checks status first, then runs `setup ensure --confirm-setup`. `agy` defaults to `$CODEX_HOME\tools\agy` and is verified against the official HTTPS manifest, trusted host, and SHA-512 on Windows. Companion registration is global and one-time, not per project, and does not inject into Electron.
+
+If tools must stay off the system drive, set `CODEX_HOME` to a non-system-drive path such as `F:\.codex` first. This relocates `agy`, download data, and Codex plugin caches. Companion must use Antigravity's official `$HOME\.gemini\config`; full-setup authorization includes that configuration write, and an environment that forbids user-profile writes cannot enable Companion.
+
 For page-control features, ensure Playwright is available in the Python environment used by Codex:
 
 ```powershell
@@ -466,6 +515,8 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - Open or create projects and read or update global/project settings.
 - Read artifacts, approve plans, and summarize tool and subagent activity.
 - Receive Hook events and run schedules through the Companion Sidecar.
+- Inject supplements into a running task through `Send Now` instead of waiting for the turn to finish.
+- Receive pre-execution approval requests for `run_command`/`ask_permission` and inspect the active approval dialog.
 - Maintain bidirectional Codex-task to Antigravity-conversation mappings.
 - Wait for an element to become attached, detached, visible, or hidden.
 - Click, fill, or press keys only after the user explicitly authorizes the specific action.
@@ -498,7 +549,9 @@ The plugin detects three backends:
 2. **Antigravity CLI (`agy`)**: creates or continues headless conversations by project, model, and effort with structured JSON output.
 3. **Companion Sidecar**: uses official `agentapi` calls, receives Hook completion events, and manages schedules.
 
-When an optional backend is absent, `doctor` reports the missing capability without installing anything. A failed write is never retried automatically through another backend.
+For supervision, immediate supplements, or first-response approval handling on a running desktop page, prefer Desktop CDP `open-new`/`send-now`; they return as soon as the UI accepts input so Codex can immediately wait for Hooks. Use Companion/`agy` for headless work without live intervention.
+
+When an optional backend is absent, `doctor` reports it. The agent may run `setup ensure --confirm-setup` only when the user explicitly asks the plugin to complete a task and authorizes full setup. Ordinary discovery and read-only requests never authorize installation. A failed write is never retried automatically through another backend.
 
 ### Install and verify
 
@@ -559,6 +612,14 @@ Click the Send button in Antigravity conversation <conversation-id>; I authorize
 
 Read-only requests do not require a CSS selector. When multiple sessions exist, the plugin checks focus; if it still cannot select exactly one session, it asks for a conversation ID.
 
+Normal users do not create the example `prompt.txt` / `supplement.txt` files. The agent sends user text directly as UTF-8 standard input to `--prompt-stdin`. Ask it to create from the only trusted shell when no conversation exists, or to send a supplement immediately without queueing, and explicitly authorize that send.
+
+### Supervisor mode
+
+Codex supervision starts with `review changes --id <id>` for the current Antigravity conversation's Review diff, then uses repository `git status` and git diff to complete and verify the picture without conflating pre-existing or other-session changes. If the Review diff already matches the implementation, no duplicate change is requested. Chat fragments are read only when needed; authorized feedback is injected with `conversation send-now`.
+
+The git workspace is taken from Hook `workspacePaths` via `event sync` / `event list`, or from a path explicitly provided by the user before Hooks are active. Multiple candidates are inspected read-only rather than guessed.
+
 ### Command reference
 
 Run the following development commands from `plugins/codex-dynamic-bridge`. For normal use, ask Codex to invoke the plugin skill instead.
@@ -568,6 +629,13 @@ P1-P3 domain commands:
 ```powershell
 # Capability discovery
 python -m bridge.cli doctor
+python -m bridge.cli setup status
+python -m bridge.cli setup ensure --confirm-setup
+python -m bridge.cli discover-pages
+
+# Create the first task from a trusted shell; inject a supplement while a task is running
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
+Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 
 # Create, continue, and wait; prefer standard input for prompts
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-id <project-id> --model <slug> --effort high --confirm-create
@@ -593,11 +661,16 @@ python -m bridge.cli artifact list --conversation-id <id>
 python -m bridge.cli artifact read --conversation-id <id> --path <relative-path>
 python -m bridge.cli artifact proceed --id <id> --confirm-artifact
 python -m bridge.cli activity --conversation-id <id>
+python -m bridge.cli review changes --id <id>
 python -m bridge.cli task link --conversation-id <id> --codex-task-id <codex-id> --project-id <project-id>
 
 # Hook events and Sidecar schedules
 python -m bridge.cli event sync
 python -m bridge.cli event list --conversation-id <id>
+python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_command --timeout-seconds 300
+python -m bridge.cli approval inspect --id <id>
+python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
+python -m bridge.cli approval respond --id <id> --decision deny --option-name <exact-deny-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
 Get-Content -Raw .\prompt.txt | python -m bridge.cli schedule create --prompt-stdin --interval-seconds 3600 --confirm-schedule
 python -m bridge.cli schedule list
 python -m bridge.cli schedule remove --schedule-id <id> --confirm-schedule
@@ -636,7 +709,7 @@ Success criteria: `companion status` reports `installed`, `enabled`, `endpointRe
 Use Codex Dynamic Bridge to sync Sidecar Hook events and list the latest 10; do not modify the Antigravity conversation.
 ```
 
-This uses Antigravity's official global plugin discovery instead of version-sensitive hot injection into Electron, and it never closes or restarts Antigravity automatically. The installer generates an official-format `hooks.json`; event delivery fails open and never blocks Antigravity. To remove it, first tell Codex, "Use Codex Dynamic Bridge to uninstall the global Companion; I authorize this uninstall," or run this from the source plugin directory:
+This uses Antigravity's official global plugin discovery instead of version-sensitive hot injection into Electron, and it never closes or restarts Antigravity automatically. Ordinary lifecycle event delivery fails open. `PreToolUse` matches only `run_command|ask_permission` and always returns Antigravity's `ask` decision, even when reporting fails; it never returns `allow` to bypass permissions. Hooks persist only allowlisted fields such as conversation ID, tool name, and approval state, never complete command arguments. To remove it, first tell Codex, "Use Codex Dynamic Bridge to uninstall the global Companion; I authorize this uninstall," or run this from the source plugin directory:
 
 ```powershell
 python -m bridge.cli companion uninstall-global --confirm-uninstall
@@ -694,6 +767,7 @@ python -m bridge.cli sync --source .\external-links.json
 - When the user explicitly asks to read, summarize, or inspect session content, the plugin may read the complete visible text of the selected session without requiring another selector.
 - `click`, `fill`, and `press` may use `--confirm-control` only after the user authorizes that specific action.
 - Conversations, models, projects, settings, artifacts, and schedules use separate `--confirm-create/send/conversation/model/project/settings/artifact/schedule` flags; authorization is not interchangeable.
+- Approval responses bind a unique event, exact visible option and submit button, and `--confirm-approval`. Without explicit authorization for the currently visible command, the agent may notify but must not approve.
 - The plugin does not expose arbitrary JavaScript, arbitrary navigation, page closing, file upload, or download commands.
 - It only connects to Antigravity sessions on `127.0.0.1`, `localhost`, or `::1`.
 - An error from a mutating command does not prove that the page remained unchanged, so the plugin never retries write actions automatically.
@@ -763,6 +837,10 @@ python -c "import playwright; print('Playwright OK')"
 **Multiple sessions were found**
 
 Run `discover`, then run `control inspect` for each candidate. Choose the only session with `hasFocus: true`, or pass a conversation ID explicitly.
+
+**The client is running with no conversation / supplements remain queued / approval events are missing**
+
+With no conversation, run `discover-pages` and create the first task from the single trusted shell with `conversation open-new`. During execution, use `conversation send-now`; it associates the message with `Send Now` and verifies that its queue item disappears. The approval path requires a global Companion install and one Antigravity restart; actively run `event wait-approval` after task submission.
 
 **The selector is not unique**
 

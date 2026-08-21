@@ -132,7 +132,7 @@ def hook_command(arguments):
 def write_hooks(destination, endpoint):
     sink = destination / "sidecars" / "codex-bridge" / "event_sink.py"
     events = {}
-    for kind in ("PostToolUse", "PostInvocation", "Stop"):
+    for kind in ("PreToolUse", "PostToolUse", "PostInvocation", "Stop"):
         entry = {
             "type": "command",
             "command": hook_command(
@@ -140,8 +140,9 @@ def write_hooks(destination, endpoint):
             ),
             "timeout": 10,
         }
-        if kind == "PostToolUse":
-            events[kind] = [{"matcher": "*", "hooks": [entry]}]
+        if kind in {"PreToolUse", "PostToolUse"}:
+            matcher = "run_command|ask_permission" if kind == "PreToolUse" else "*"
+            events[kind] = [{"matcher": matcher, "hooks": [entry]}]
         else:
             events[kind] = [entry]
     hooks = {"codex-dynamic-bridge-events": events}

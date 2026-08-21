@@ -18,6 +18,7 @@ EVENT_FIELDS = {
     "toolName",
     "projectId",
     "status",
+    "approvalState",
 }
 TASK_FIELDS = {
     "conversationId",
@@ -80,11 +81,18 @@ class EventStore:
     def append(self, kind, payload):
         if not isinstance(payload, dict):
             raise StateError("Hook 输入必须是 JSON 对象")
+        tool_call = payload.get("toolCall")
+        tool_name = tool_call.get("name") if isinstance(tool_call, dict) else None
         event = {
             "kind": kind,
             "observedAt": utc_now(),
             **{key: payload[key] for key in EVENT_FIELDS if key in payload},
         }
+        if isinstance(tool_name, str) and tool_name.strip():
+            event["toolName"] = tool_name.strip()[:128]
+        if kind == "PreToolUse":
+            event.setdefault("approvalState", "requested")
+            event.setdefault("status", "waiting_approval")
         if not event.get("conversationId"):
             raise StateError("Hook 输入缺少 conversationId")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +156,31 @@ class EventStore:
                 return event
             if time.monotonic() >= deadline:
                 raise StateError(f"等待会话完成超时: {conversation_id}")
+            time.sleep(poll_seconds)
+
+    def wait_approval(
+        self,
+        conversation_id,
+        timeout_seconds=30,
+        poll_seconds=0.25,
+        tool_name=None,
+        after=None,
+    ):
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            events = self.list(conversation_id=conversation_id, limit=1000)
+            for event in reversed(events):
+                if event.get("kind") != "PreToolUse":
+                    continue
+                if event.get("approvalState") != "requested":
+                    continue
+                if tool_name and event.get("toolName") != tool_name:
+                    continue
+                if after and event.get("observedAt", "") <= after:
+                    continue
+                return event
+            if time.monotonic() >= deadline:
+                raise StateError(f"等待会话审批请求超时: {conversation_id}")
             time.sleep(poll_seconds)
 
     def summary(self, conversation_id):

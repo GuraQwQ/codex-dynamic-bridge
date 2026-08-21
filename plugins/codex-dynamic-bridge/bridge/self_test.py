@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
@@ -7,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from bridge import cli, companion, control, runtime, state
+from bridge import cli, companion, control, runtime, setup as bridge_setup, state
 
 
 class FakeTarget:
@@ -79,6 +80,9 @@ class FakeTarget:
     def wait_for(self, state, timeout):
         self.waited = (state, timeout)
 
+    def get_attribute(self, name):
+        return getattr(self, name.replace("-", "_"), None)
+
 
 class FakeLocator:
     def __init__(self, targets):
@@ -121,17 +125,26 @@ class FakeKeyboard:
 
 
 class FakePage:
-    def __init__(self, targets):
+    def __init__(
+        self,
+        targets,
+        url="https://127.0.0.1:3900/c/test",
+        role_targets=None,
+    ):
         self.targets = targets
+        self.role_targets = role_targets or {}
         self.settled = None
         self.keyboard = FakeKeyboard()
+        self.url = url
+        self.next_url = "https://127.0.0.1:3900/c/new-conversation"
+        self.url_sequence = []
 
     def locator(self, _):
         return FakeLocator(self.targets)
 
     def get_by_role(self, role, name, exact):
         self.role_query = (role, name, exact)
-        return FakeLocator(self.targets)
+        return FakeLocator(self.role_targets.get((role, name), self.targets))
 
     def get_by_text(self, text, exact):
         self.text_query = (text, exact)
@@ -144,7 +157,7 @@ class FakePage:
     def evaluate(self, _):
         return {
             "title": "测试会话",
-            "url": "https://127.0.0.1:3900/c/test",
+            "url": self.url,
             "hasFocus": True,
             "readyState": "complete",
             "viewport": {"width": 1000, "height": 700},
@@ -154,6 +167,34 @@ class FakePage:
 
     def wait_for_timeout(self, milliseconds):
         self.settled = milliseconds
+
+    def wait_for_url(self, predicate, timeout):
+        self.wait_url_timeout = timeout
+        self.url = self.url_sequence.pop(0) if self.url_sequence else self.next_url
+        if not predicate(self.url):
+            raise RuntimeError("URL 未匹配")
+
+
+class FakeHTTPResponse:
+    def __init__(self, content):
+        self.content = content
+        self.offset = 0
+        self.status = 200
+        self.headers = {"Content-Length": str(len(content))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self, size=-1):
+        if self.offset >= len(self.content):
+            return b""
+        end = len(self.content) if size < 0 else self.offset + size
+        chunk = self.content[self.offset:end]
+        self.offset += len(chunk)
+        return chunk
 
 
 class FakeProcessResult:
@@ -266,6 +307,49 @@ class BridgeTestCase(unittest.TestCase):
                 }
             ],
         )
+
+    def test_discover_pages_保留可信外壳并拒绝外部页面(self):
+        pages = [
+            {
+                "id": "shell-1",
+                "type": "page",
+                "title": "Antigravity",
+                "url": "https://127.0.0.1:3639/?section=test",
+            },
+            {
+                "id": "conversation-1",
+                "type": "page",
+                "title": "会话",
+                "url": "https://localhost:3639/c/conversation-1",
+            },
+            {
+                "id": "external",
+                "type": "page",
+                "title": "Antigravity",
+                "url": "https://example.com/",
+            },
+            {
+                "id": "wrong-title",
+                "type": "page",
+                "title": "其他页面",
+                "url": "https://127.0.0.1:3639/",
+            },
+        ]
+        discovered = cli.discover_app_pages(pages)
+        self.assertEqual(
+            [(item["kind"], item["devtoolsId"]) for item in discovered],
+            [("shell", "shell-1"), ("conversation", "conversation-1")],
+        )
+
+    def test_select_app_page_多目标时拒绝猜测并支持_devtools_id(self):
+        pages = [
+            {"devtoolsId": "shell-1", "conversationId": None},
+            {"devtoolsId": "conversation-1", "conversationId": "conversation-id"},
+        ]
+        with self.assertRaises(cli.BridgeError):
+            cli.select_app_page(pages)
+        self.assertEqual(cli.select_app_page(pages, "shell-1"), pages[0])
+        self.assertEqual(cli.select_app_page(pages, "conversation-id"), pages[1])
 
     def test_多会话时必须显式选择(self):
         sessions = [
@@ -422,6 +506,80 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(page.keyboard.typed, "目标会话")
         self.assertEqual(page.keyboard.key, "Enter")
 
+    def test_desktop_根页面可_bootstrap_新会话(self):
+        new_button = FakeTarget()
+        message_input = FakeTarget()
+        send_button = FakeTarget()
+        page = FakePage(
+            [],
+            url="https://127.0.0.1:3900/c/old-conversation",
+            role_targets={
+                ("button", "New Conversation"): [new_button],
+                ("combobox", "Message input"): [message_input],
+                ("button", "Send message"): [send_button],
+            },
+        )
+        page.url_sequence = [
+            "https://127.0.0.1:3900/?section=test",
+            "https://127.0.0.1:3900/c/new-conversation",
+        ]
+        result = control.perform_workflow(
+            page,
+            argparse.Namespace(
+                workflow_action="conversation-new",
+                prompt="执行新任务",
+                timeout_ms=1200,
+                settle_ms=10,
+            ),
+        )
+        self.assertEqual(new_button.clicked, 1200)
+        self.assertEqual(message_input.value, "执行新任务")
+        self.assertEqual(send_button.clicked, 1200)
+        self.assertEqual(page.wait_url_timeout, 1200)
+        self.assertEqual(result["detail"]["conversationId"], "new-conversation")
+        self.assertEqual(result["detail"]["promptLength"], 5)
+
+    def test_open_new_无需会话_id_并传递可信页面_url(self):
+        target = {
+            "kind": "shell",
+            "conversationId": None,
+            "devtoolsId": "shell-1",
+            "title": "Antigravity",
+            "url": "https://127.0.0.1:3900/?section=test",
+        }
+        args = argparse.Namespace(
+            id=None,
+            prompt="执行任务",
+            prompt_stdin=False,
+            timeout_ms=1000,
+            settle_ms=10,
+        )
+        with (
+            mock.patch.object(cli, "discover_app_pages", return_value=[target]),
+            mock.patch.object(cli, "read_antigravity_port", return_value=3000),
+            mock.patch.object(
+                control,
+                "execute_control",
+                return_value={"detail": {"conversationId": "created-id"}},
+            ) as execute,
+        ):
+            result, output = self.capture(cli.run_new_conversation_workflow, args)
+        self.assertEqual(result["conversationId"], "created-id")
+        self.assertTrue(result["bootstrappedFromShell"])
+        self.assertEqual(output, result)
+        self.assertEqual(execute.call_args.kwargs["page_url"], target["url"])
+
+        parsed = cli.build_parser().parse_args(
+            [
+                "conversation",
+                "open-new",
+                "--prompt",
+                "执行任务",
+                "--confirm-conversation",
+            ]
+        )
+        self.assertIsNone(parsed.id)
+
     def test_desktop_设置布尔值(self):
         target = FakeTarget()
         page = FakePage([target])
@@ -554,6 +712,109 @@ class BridgeTestCase(unittest.TestCase):
         with self.assertRaises(runtime.RuntimeBridgeError):
             client.list_models()
 
+    def test_setup_从_codex_home_发现_agy(self):
+        codex_home = Path(self.temporary_directory.name) / "codex"
+        executable = codex_home / "tools" / "agy" / "agy.exe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"agy")
+        self.assertEqual(
+            runtime.find_agy({"CODEX_HOME": str(codex_home)}),
+            str(executable),
+        )
+
+    def test_setup_系统盘默认拒绝且官方清单校验后原子安装(self):
+        install_dir = Path(self.temporary_directory.name) / "agy"
+        with self.assertRaises(bridge_setup.SetupError):
+            bridge_setup.validate_install_dir(
+                install_dir,
+                env={"SystemDrive": install_dir.drive},
+                platform_name="nt",
+            )
+
+        payload = b"MZtest-agy"
+        digest = hashlib.sha512(payload).hexdigest()
+        manifest = json.dumps(
+            {
+                "version": "1.2.3",
+                "url": "https://storage.googleapis.com/example/agy.exe",
+                "sha512": digest,
+            }
+        ).encode("utf-8")
+        opened = []
+
+        def opener(request, **_kwargs):
+            opened.append(request.full_url)
+            content = manifest if "/manifests/" in request.full_url else payload
+            return FakeHTTPResponse(content)
+
+        result = bridge_setup.ensure_agy(
+            install_dir=install_dir,
+            env={"PATH": "", "SystemDrive": install_dir.drive},
+            allow_system_drive=True,
+            platform_name="nt",
+            machine_name="AMD64",
+            opener=opener,
+            prefer_curl=False,
+        )
+        self.assertTrue(result["installed"])
+        self.assertEqual((install_dir / "agy.exe").read_bytes(), payload)
+        self.assertEqual(result["sha512"], digest)
+        self.assertEqual(len(opened), 2)
+        self.assertIn("windows_amd64.json", opened[0])
+
+    def test_setup_校验失败时不写入_agy(self):
+        install_dir = Path(self.temporary_directory.name) / "agy"
+        manifest = json.dumps(
+            {
+                "version": "1.2.3",
+                "url": "https://storage.googleapis.com/example/agy.exe",
+                "sha512": "0" * 128,
+            }
+        ).encode("utf-8")
+
+        def opener(request, **_kwargs):
+            content = manifest if "/manifests/" in request.full_url else b"MZcorrupt"
+            return FakeHTTPResponse(content)
+
+        with self.assertRaises(bridge_setup.SetupError):
+            bridge_setup.ensure_agy(
+                install_dir=install_dir,
+                env={"SystemDrive": install_dir.drive},
+                allow_system_drive=True,
+                platform_name="nt",
+                machine_name="AMD64",
+                opener=opener,
+                prefer_curl=False,
+            )
+        self.assertFalse((install_dir / "agy.exe").exists())
+
+    def test_setup_curl_从_partial_续传后仍校验_sha512(self):
+        payload = b"MZ-complete-binary"
+        staging = Path(self.temporary_directory.name) / "agy.partial"
+        staging.write_bytes(payload[:5])
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            output = Path(command[command.index("--output") + 1])
+            with output.open("ab") as stream:
+                stream.write(payload[5:])
+            return FakeProcessResult("")
+
+        with mock.patch.object(
+            bridge_setup.shutil, "which", return_value="F:/Windows/curl.exe"
+        ):
+            digest = bridge_setup.download_verified_binary_with_curl(
+                "https://storage.googleapis.com/example/agy.exe",
+                hashlib.sha512(payload).hexdigest(),
+                staging,
+                env={"PATH": "F:/Windows"},
+                runner=runner,
+            )
+        self.assertEqual(digest, hashlib.sha512(payload).hexdigest())
+        self.assertEqual(staging.read_bytes(), payload)
+        self.assertIn("--continue-at", calls[0][0])
+
     def test_需要模型参数时禁止_sidecar_降级(self):
         with self.assertRaises(cli.BridgeError):
             cli.select_runtime_backend("sidecar", require_agy=True)
@@ -575,6 +836,24 @@ class BridgeTestCase(unittest.TestCase):
         task = task_store.sync_event(event)
         self.assertEqual(task["status"], "idle")
         self.assertEqual(task["model"], "gemini-test")
+
+        approval = event_store.append(
+            "PreToolUse",
+            {
+                "conversationId": "conversation-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "包含敏感参数"},
+                },
+            },
+        )
+        self.assertEqual(approval["toolName"], "run_command")
+        self.assertEqual(approval["approvalState"], "requested")
+        self.assertNotIn("toolCall", approval)
+        self.assertEqual(
+            event_store.wait_approval("conversation-1", timeout_seconds=0),
+            approval,
+        )
 
     def test_event_wait_读取已完成事件(self):
         event_store = state.EventStore(Path(self.temporary_directory.name) / "events.jsonl")
@@ -607,6 +886,9 @@ class BridgeTestCase(unittest.TestCase):
         self.assertFalse(any(destination.rglob("__pycache__")))
         hooks = json.loads((destination / "hooks.json").read_text(encoding="utf-8"))
         events = hooks["codex-dynamic-bridge-events"]
+        self.assertEqual(
+            events["PreToolUse"][0]["matcher"], "run_command|ask_permission"
+        )
         self.assertIn("hooks", events["PostToolUse"][0])
         self.assertIn("command", events["PostInvocation"][0])
         self.assertIn("command", events["Stop"][0])
@@ -748,6 +1030,161 @@ class BridgeTestCase(unittest.TestCase):
             ["companion", "install-global", "--confirm-install"]
         )
         self.assertEqual(args.project_id, companion.DEFAULT_PROJECT_ID)
+
+    def test_setup_cli_必须显式确认完整装载(self):
+        with self.assertRaises(cli.BridgeError):
+            cli.setup_command(
+                argparse.Namespace(setup_action="ensure", confirm_setup=False)
+            )
+        args = cli.build_parser().parse_args(["setup", "ensure", "--confirm-setup"])
+        self.assertEqual(args.project_id, companion.DEFAULT_PROJECT_ID)
+        self.assertIsNone(args.agy_dir)
+
+    def test_审批响应要求精确事件与显式确认(self):
+        with self.assertRaises(cli.BridgeError):
+            cli.approval_command(
+                argparse.Namespace(
+                    approval_action="respond",
+                    confirm_approval=False,
+                )
+            )
+
+        parsed = cli.build_parser().parse_args(
+            [
+                "event",
+                "wait-approval",
+                "--conversation-id",
+                "conversation-1",
+                "--tool-name",
+                "run_command",
+            ]
+        )
+        self.assertEqual(parsed.timeout_seconds, 300)
+
+    def test_desktop_审批检查与响应(self):
+        button = FakeTarget("允许")
+        page = FakePage(
+            [button],
+            role_targets={("button", "允许"): [button]},
+        )
+        before = {
+            "open": True,
+            "text": "是否允许运行此命令？\npnpm test",
+            "textLength": 24,
+            "buttons": ["拒绝", "允许"],
+            "options": [
+                {"name": "是，仅允许本次执行", "decision": "allow", "checked": False}
+            ],
+        }
+        after = {"open": False, "text": "", "textLength": 0, "buttons": []}
+        with mock.patch.object(
+            control, "approval_dialog_snapshot", side_effect=[before, after]
+        ):
+            result = control.perform_workflow(
+                page,
+                argparse.Namespace(
+                    workflow_action="approval-respond",
+                    decision="allow",
+                    button_name="允许",
+                    option_name="是，仅允许本次执行",
+                    timeout_ms=1000,
+                    settle_ms=10,
+                ),
+            )
+        self.assertEqual(button.clicked, 1000)
+        self.assertFalse(result["detail"]["after"]["open"])
+
+    def test_desktop_立即发送补充而不等待当前回合结束(self):
+        message_input = FakeTarget()
+        send_now = FakeTarget("Send Now")
+        page = FakePage(
+            [message_input],
+            role_targets={("combobox", "Message input"): [message_input]},
+        )
+        with mock.patch.object(
+            control,
+            "queued_send_now_target",
+            side_effect=[send_now, control.ControlError("队列项已消失")],
+        ):
+            result = control.perform_workflow(
+                page,
+                argparse.Namespace(
+                    workflow_action="conversation-send-now",
+                    prompt="立即补充",
+                    timeout_ms=1000,
+                    settle_ms=10,
+                ),
+            )
+        self.assertEqual(message_input.value, "立即补充")
+        self.assertEqual(message_input.pressed, ("Enter", 1000))
+        self.assertEqual(send_now.clicked, 1000)
+        self.assertTrue(result["detail"]["sentImmediately"])
+
+        parsed = cli.build_parser().parse_args(
+            [
+                "conversation",
+                "send-now",
+                "--id",
+                "conversation-1",
+                "--prompt",
+                "补充",
+                "--confirm-send",
+            ]
+        )
+        self.assertEqual(parsed.conversation_action, "send-now")
+
+    def test_监工优先读取当前会话_review_diff(self):
+        review_tab = FakeTarget("Review tab")
+        review_region = FakeTarget("评审内容")
+        page = FakePage(
+            [review_tab],
+            url="https://127.0.0.1:3900/c/test?tab=overview",
+            role_targets={
+                ("button", "Review tab"): [review_tab],
+                ("region", "评审"): [review_region],
+                ("region", "Review"): [],
+            },
+        )
+        result = control.perform_workflow(
+            page,
+            argparse.Namespace(
+                workflow_action="review-changes",
+                timeout_ms=1000,
+                settle_ms=10,
+                max_controls=20,
+            ),
+        )
+        self.assertEqual(review_tab.clicked, 1000)
+        self.assertIn("snapshot", result["detail"])
+
+        parsed = cli.build_parser().parse_args(
+            ["review", "changes", "--id", "conversation-1"]
+        )
+        self.assertEqual(parsed.review_action, "changes")
+
+    def test_review_diff_自动展开辅助面板(self):
+        review_tab = FakeTarget("Review tab")
+        toggle = FakeTarget("切换辅助面板")
+        review_locator = FakeLocator([])
+
+        def reveal_review(timeout):
+            toggle.clicked = timeout
+            review_locator.targets.append(review_tab)
+
+        toggle.click = reveal_review
+        page = FakePage([review_tab])
+
+        def get_by_role(role, name, exact):
+            if (role, name) == ("button", "Review tab"):
+                return review_locator
+            if (role, name) == ("button", "切换辅助面板"):
+                return FakeLocator([toggle])
+            return FakeLocator([])
+
+        page.get_by_role = get_by_role
+        result = control.review_tab_target(page, 1000)
+        self.assertIs(result, review_tab)
+        self.assertEqual(toggle.clicked, 1000)
 
     def test_doctor_自动报告_companion_注册状态(self):
         summary = {"sidecar": {"configured": False}}

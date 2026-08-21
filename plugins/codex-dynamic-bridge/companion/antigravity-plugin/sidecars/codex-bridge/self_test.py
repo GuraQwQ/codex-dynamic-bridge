@@ -7,6 +7,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import server
+import event_sink
 
 
 class SidecarTestCase(unittest.TestCase):
@@ -59,6 +60,21 @@ class SidecarTestCase(unittest.TestCase):
         self.assertNotIn("token", event)
         _, result = self.request("GET", "/v1/events?conversation_id=conversation-1")
         self.assertEqual(len(result["events"]), 1)
+
+    def test_pre_tool_use_只保留工具名和审批状态(self):
+        event = event_sink.sanitize_event(
+            "PreToolUse",
+            {
+                "conversationId": "conversation-1",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "secret command"},
+                },
+            },
+        )
+        self.assertEqual(event["toolName"], "run_command")
+        self.assertEqual(event["approvalState"], "requested")
+        self.assertNotIn("toolCall", event)
 
     def test_schedule_创建列出删除(self):
         status, schedule = self.request(

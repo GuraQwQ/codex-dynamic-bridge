@@ -3,7 +3,7 @@
 该伴生插件为 Codex Dynamic Bridge 提供稳定的本机 Sidecar 后端：
 
 - 使用 Antigravity 官方 `agentapi` 新建会话和发送消息。
-- 通过 Hook 接收会话生命周期事件。
+- 通过 Hook 接收会话生命周期事件，并在 `run_command`/`ask_permission` 前上报审批请求。
 - 管理最小间隔为 60 秒的本地定时任务。
 - 仅绑定 `127.0.0.1`，每次启动生成随机令牌；普通会话请求不额外记录提示词。
 - 定时任务必须把提示词保存在 Sidecar 私有 `data/schedules.json` 中，但不会持久化模型回复正文。
@@ -31,6 +31,13 @@ python -m bridge.cli companion uninstall-global --confirm-uninstall
 Hook 命令需要指向 `event_sink.py` 和 Sidecar 运行数据目录中的 `endpoint.json` 绝对路径。
 不要把 `endpoint.json` 或其中的令牌提交到 Git。
 
+`PreToolUse` 只匹配 `run_command|ask_permission`，返回 Antigravity 官方 `ask` 决策。即使事件上报失败也不会返回 `allow`，因此不会绕过原有权限提示。事件仅保留 conversation ID、工具名、审批状态等白名单字段，不传输或保存完整命令参数。安装或更新 Hook 后需要重启一次 Antigravity；随后 Codex 可运行：
+
+```powershell
+python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_command
+python -m bridge.cli approval inspect --id <id>
+```
+
 ## English
 
 The source is under `antigravity-plugin/`. Register it globally once from the Codex plugin root:
@@ -55,3 +62,9 @@ python -m bridge.cli companion uninstall-global --confirm-uninstall
 
 Hook commands use absolute paths to `event_sink.py` and the runtime `endpoint.json`. Never commit
 `endpoint.json` or its token.
+
+`PreToolUse` matches only `run_command|ask_permission` and returns Antigravity's official `ask`
+decision. A reporting failure never changes this to `allow`, so the Hook cannot bypass the normal
+permission prompt. Only allowlisted fields such as conversation ID, tool name, and approval state
+are transmitted and persisted; complete command arguments are not. Restart Antigravity once after
+installing or updating the Hook, then Codex can use `event wait-approval` and `approval inspect`.

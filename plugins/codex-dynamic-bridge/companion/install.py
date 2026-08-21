@@ -49,14 +49,15 @@ def main():
     sink = destination / "sidecars" / "codex-bridge" / "event_sink.py"
     endpoint = args.endpoint_file.expanduser().resolve()
     hooks = {"codex-dynamic-bridge-events": {}}
-    for kind in ("PostToolUse", "PostInvocation", "Stop"):
+    for kind in ("PreToolUse", "PostToolUse", "PostInvocation", "Stop"):
         command = command_line(
             [sys.executable, str(sink), kind, "--endpoint-file", str(endpoint)]
         )
         entry = {"type": "command", "command": command, "timeout": 10}
-        if kind == "PostToolUse":
+        if kind in {"PreToolUse", "PostToolUse"}:
+            matcher = "run_command|ask_permission" if kind == "PreToolUse" else "*"
             hooks["codex-dynamic-bridge-events"][kind] = [
-                {"matcher": "*", "hooks": [entry]}
+                {"matcher": matcher, "hooks": [entry]}
             ]
         else:
             hooks["codex-dynamic-bridge-events"][kind] = [entry]

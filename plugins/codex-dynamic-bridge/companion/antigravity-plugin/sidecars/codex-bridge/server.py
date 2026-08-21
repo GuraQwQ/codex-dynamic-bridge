@@ -28,6 +28,7 @@ EVENT_FIELDS = {
     "toolName",
     "projectId",
     "status",
+    "approvalState",
     "observedAt",
 }
 
@@ -87,6 +88,13 @@ def run_agentapi(arguments, timeout=300):
 
 def append_event(payload):
     event = {key: payload[key] for key in EVENT_FIELDS if key in payload}
+    tool_call = payload.get("toolCall")
+    tool_name = tool_call.get("name") if isinstance(tool_call, dict) else None
+    if isinstance(tool_name, str) and tool_name.strip():
+        event["toolName"] = tool_name.strip()[:128]
+    if event.get("kind") == "PreToolUse":
+        event.setdefault("approvalState", "requested")
+        event.setdefault("status", "waiting_approval")
     event.setdefault("observedAt", utc_now())
     if not event.get("conversationId"):
         raise ValueError("事件缺少 conversationId")
