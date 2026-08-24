@@ -106,6 +106,57 @@ def read_target_text(target, timeout_ms):
     return {"text": text, "textLength": len(text)}
 
 
+def conversation_message_targets(page):
+    """只选择会话正文 article，排除导航、项目列表和菜单。"""
+    articles = page.locator(
+        '[role="article"][aria-label="User message"], '
+        '[role="article"][aria-label="Agent response"]'
+    )
+    if articles.count():
+        return articles
+    main = page.locator("main")
+    if main.count() == 1:
+        return main
+    raise ControlError("无法识别 Antigravity 会话正文区域，拒绝读取整页噪声")
+
+
+def read_conversation_text(page, timeout_ms):
+    targets = conversation_message_targets(page)
+    messages = []
+    for index in range(targets.count()):
+        target = targets.nth(index)
+        messages.append(
+            {
+                "index": index,
+                "role": target.get_attribute("aria-label"),
+                **read_target_text(target, timeout_ms),
+            }
+        )
+    content = "\n\n".join(item["text"] for item in messages if item["text"])
+    return {
+        "content": content,
+        "textLength": len(content),
+        "messageCount": len(messages),
+        "messages": messages,
+    }
+
+
+def snapshot_conversation(page, timeout_ms, max_controls):
+    targets = conversation_message_targets(page)
+    messages = []
+    for index in range(targets.count()):
+        target = targets.nth(index)
+        messages.append(
+            {
+                "index": index,
+                "role": target.get_attribute("aria-label"),
+                "text": read_target_text(target, timeout_ms),
+                "snapshot": snapshot_target(target, timeout_ms, max_controls),
+            }
+        )
+    return {"messageCount": len(messages), "messages": messages}
+
+
 def snapshot_target(target, timeout_ms, max_controls):
     """返回可访问性快照和可交互控件摘要。"""
     snapshot = target.aria_snapshot(timeout=timeout_ms)
@@ -627,6 +678,14 @@ def perform_action(page, args):
         return result
 
     if action == "snapshot":
+        if args.selector is None:
+            return {
+                "action": action,
+                "snapshot": snapshot_conversation(
+                    page, args.timeout_ms, args.max_controls
+                ),
+                "page": page_info(page),
+            }
         target, count, index = resolve_target(page, args.selector, args.nth)
         return {
             "action": action,
@@ -665,6 +724,13 @@ def perform_action(page, args):
             "completed": True,
         }
 
+    if action == "read":
+        if args.selector is None:
+            return {
+                "action": action,
+                **read_conversation_text(page, args.timeout_ms),
+                "page": page_info(page),
+            }
     target, count, index = resolve_target(page, args.selector, args.nth)
     if action == "read":
         return {

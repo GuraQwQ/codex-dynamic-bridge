@@ -160,7 +160,7 @@ def validate_config(config):
         raise CompanionError(f"Sidecar 配置必须是对象: {SIDECAR_ID}")
 
 
-def staged_plugin(destination, endpoint):
+def staged_plugin(destination, endpoint=None):
     source = source_plugin()
     if not (source / "plugin.json").is_file():
         raise CompanionError(f"找不到 Companion 源码: {source}")
@@ -171,11 +171,6 @@ def staged_plugin(destination, endpoint):
         stage,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "data"),
     )
-    try:
-        write_hooks(stage, endpoint)
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
     return stage
 
 
@@ -229,6 +224,8 @@ def install_global(project_id, env=None):
             moved_destination = True
         os.replace(stage, destination)
         installed_stage = True
+        # Hook 命令必须引用最终稳定目录；暂存目录会在事务结束时删除。
+        write_hooks(destination, endpoint_file(env))
         atomic_write_json(config_path, updated)
     except Exception:
         if stage.exists():

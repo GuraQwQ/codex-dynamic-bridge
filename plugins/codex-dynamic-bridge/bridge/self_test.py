@@ -175,6 +175,13 @@ class FakePage:
             raise RuntimeError("URL 未匹配")
 
 
+class FakeConversationPage(FakePage):
+    def locator(self, selector):
+        if "[role=\"article\"]" in selector:
+            return FakeLocator(self.targets)
+        return FakeLocator([])
+
+
 class FakeHTTPResponse:
     def __init__(self, content):
         self.content = content
@@ -417,13 +424,27 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(result["content"], {"text": text, "textLength": len(text)})
         self.assertEqual(target.read_timeout, 1234)
 
-    def test_control_read_默认读取_body(self):
+    def test_control_read_默认只读取会话正文(self):
         args = cli.build_parser().parse_args(
             ["control", "read", "--id", "conversation-1"]
         )
-        self.assertEqual(args.selector, "body")
+        self.assertIsNone(args.selector)
         self.assertIsNone(args.nth)
         self.assertFalse(hasattr(args, "confirm_control"))
+
+    def test_control_read_默认排除侧栏噪声(self):
+        page = FakeConversationPage([FakeTarget("用户消息"), FakeTarget("Agent 回复")])
+        result = control.perform_action(
+            page,
+            argparse.Namespace(
+                control_action="read",
+                selector=None,
+                nth=None,
+                timeout_ms=1234,
+            ),
+        )
+        self.assertEqual(result["messageCount"], 2)
+        self.assertEqual(result["content"], "用户消息\n\nAgent 回复")
 
     def test_control_snapshot_返回可访问性信息(self):
         target = FakeTarget()
@@ -697,6 +718,59 @@ class BridgeTestCase(unittest.TestCase):
         self.assertIn("--project=project-1", command)
         self.assertIn("gemini-test", command)
 
+    def test_agy_使用用户项目目录和新项目开关(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return FakeProcessResult(
+                json.dumps({"conversation_id": "conversation-2", "status": "SUCCESS"})
+            )
+
+        project = Path(self.temporary_directory.name) / "project"
+        project.mkdir()
+        client = runtime.AgyClient(executable="F:/tools/agy.exe", runner=runner)
+        client.run_prompt("新任务", project_path=project, new_project=True)
+        command, kwargs = calls[0]
+        self.assertIn("--new-project", command)
+        self.assertEqual(kwargs["cwd"], str(project.resolve()))
+
+    def test_conversation_send_auto_桌面会话优先立即发送(self):
+        args = cli.build_parser().parse_args(
+            [
+                "conversation",
+                "send",
+                "--conversation-id",
+                "conversation-1",
+                "--prompt",
+                "立即补充",
+                "--confirm-send",
+            ]
+        )
+        with (
+            mock.patch.object(cli, "discover_sessions", return_value=[{"conversationId": "conversation-1", "devtoolsId": "d"}]),
+            mock.patch.object(cli, "desktop_conversation_command", return_value={"sent": True}) as send_now,
+        ):
+            result = cli.conversation_command(args)
+        self.assertEqual(result, {"sent": True})
+        self.assertEqual(args.id, "conversation-1")
+        send_now.assert_called_once_with(args)
+
+    def test_conversation_resume_解析并要求确认(self):
+        parsed = cli.build_parser().parse_args(
+            [
+                "conversation",
+                "resume",
+                "--conversation-id",
+                "conversation-1",
+                "--prompt",
+                "继续",
+                "--confirm-send",
+            ]
+        )
+        self.assertEqual(parsed.conversation_action, "resume")
+        self.assertTrue(parsed.confirm_send)
+
     def test_agy_拒绝失败和非_json(self):
         client = runtime.AgyClient(
             executable="agy",
@@ -892,6 +966,8 @@ class BridgeTestCase(unittest.TestCase):
         self.assertIn("hooks", events["PostToolUse"][0])
         self.assertIn("command", events["PostInvocation"][0])
         self.assertIn("command", events["Stop"][0])
+        self.assertIn(str(destination), events["Stop"][0]["command"])
+        self.assertNotIn(".tmp", events["Stop"][0]["command"])
 
         (destination / "stale.txt").write_text("旧文件", encoding="utf-8")
         second = companion.install_global("project-2", env)

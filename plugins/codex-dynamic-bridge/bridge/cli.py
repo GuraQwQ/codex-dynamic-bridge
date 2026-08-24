@@ -512,13 +512,36 @@ def conversation_command(args):
         )
 
     prompt = prompt_from_args(args)
+    if args.conversation_action in {"send", "resume"} and args.backend == "auto":
+        try:
+            select_sessions(discover_sessions(), args.conversation_id)
+        except BridgeError:
+            pass
+        else:
+            args.id = args.conversation_id
+            args.timeout_ms = min(args.timeout_seconds * 1000, 30000)
+            args.settle_ms = 250
+            args.confirm_send = True
+            args.prompt = prompt
+            args.conversation_action = "send-now"
+            return desktop_conversation_command(args)
     require_agy = bool(
         args.model
         or args.effort
         or args.agent
         or getattr(args, "project_id", None)
+        or getattr(args, "project_path", None)
+        or getattr(args, "new_project", False)
+        or args.conversation_action == "resume"
     )
-    backend, client = select_runtime_backend(args.backend, require_agy=require_agy)
+    backend_name = args.backend
+    if (
+        args.conversation_action in {"send", "resume"}
+        and backend_name == "auto"
+        and find_agy()
+    ):
+        backend_name = "agy"
+    backend, client = select_runtime_backend(backend_name, require_agy=require_agy)
     if args.conversation_action == "new":
         if not args.confirm_create:
             raise BridgeError("新建会话会修改 Antigravity；请在明确授权后传入 --confirm-create")
@@ -532,6 +555,8 @@ def conversation_command(args):
                 effort=args.effort,
                 agent=args.agent,
                 timeout_seconds=args.timeout_seconds,
+                project_path=getattr(args, "project_path", None),
+                new_project=getattr(args, "new_project", False),
             )
     else:
         if not args.confirm_send:
@@ -546,6 +571,7 @@ def conversation_command(args):
                 effort=args.effort,
                 agent=args.agent,
                 timeout_seconds=args.timeout_seconds,
+                project_path=getattr(args, "project_path", None),
             )
 
     conversation_id = result.get("conversation_id") or result.get("conversationId")
@@ -976,6 +1002,16 @@ def build_parser():
     new_prompt.add_argument("--prompt-stdin", action="store_true")
     new_conversation_parser.add_argument("--backend", choices=("auto", "agy", "sidecar"), default="auto")
     new_conversation_parser.add_argument("--project-id")
+    new_conversation_parser.add_argument(
+        "--project-path",
+        type=Path,
+        help="用户项目目录；agy 将以此目录作为工作目录",
+    )
+    new_conversation_parser.add_argument(
+        "--new-project",
+        action="store_true",
+        help="在 --project-path 中创建 Antigravity 项目",
+    )
     new_conversation_parser.add_argument("--model")
     new_conversation_parser.add_argument("--effort", choices=("low", "medium", "high"))
     new_conversation_parser.add_argument("--agent")
@@ -995,6 +1031,22 @@ def build_parser():
     send_conversation_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=300)
     send_conversation_parser.add_argument("--confirm-send", action="store_true")
     send_conversation_parser.set_defaults(func=conversation_command)
+
+    resume_conversation_parser = conversation_subparsers.add_parser(
+        "resume", help="恢复已停止会话；优先桌面页面，其次使用 agy"
+    )
+    resume_conversation_parser.add_argument("--conversation-id", required=True)
+    resume_prompt = resume_conversation_parser.add_mutually_exclusive_group(required=True)
+    resume_prompt.add_argument("--prompt")
+    resume_prompt.add_argument("--prompt-stdin", action="store_true")
+    resume_conversation_parser.add_argument("--backend", choices=("auto", "agy"), default="auto")
+    resume_conversation_parser.add_argument("--project-path", type=Path)
+    resume_conversation_parser.add_argument("--model")
+    resume_conversation_parser.add_argument("--effort", choices=("low", "medium", "high"))
+    resume_conversation_parser.add_argument("--agent")
+    resume_conversation_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=300)
+    resume_conversation_parser.add_argument("--confirm-send", action="store_true")
+    resume_conversation_parser.set_defaults(func=conversation_command)
 
     send_now_conversation_parser = conversation_subparsers.add_parser(
         "send-now", help="将补充内容立即注入正在执行的桌面会话"
@@ -1266,8 +1318,8 @@ def build_parser():
     add_control_target_arguments(read_parser)
     read_parser.add_argument(
         "--selector",
-        default="body",
-        help="Playwright 定位器或 CSS 选择器，默认 body",
+        default=None,
+        help="Playwright 定位器或 CSS 选择器；省略时只读取会话正文",
     )
     read_parser.add_argument(
         "--nth",
@@ -1280,7 +1332,11 @@ def build_parser():
         "snapshot", help="只读获取页面可访问性快照和语义控件摘要"
     )
     add_control_target_arguments(snapshot_parser)
-    snapshot_parser.add_argument("--selector", default="body", help="快照根选择器，默认 body")
+    snapshot_parser.add_argument(
+        "--selector",
+        default=None,
+        help="快照根选择器；省略时只读取会话正文",
+    )
     snapshot_parser.add_argument(
         "--nth",
         type=nonnegative_integer,

@@ -47,7 +47,7 @@ class AgyClient:
                 "未找到 Antigravity CLI；设置 CODEX_DYNAMIC_BRIDGE_AGY 或安装 agy"
             )
 
-    def invoke(self, arguments, timeout_seconds=300):
+    def invoke(self, arguments, timeout_seconds=300, cwd=None):
         command = [self.executable, *arguments]
         try:
             result = self.runner(
@@ -58,6 +58,7 @@ class AgyClient:
                 errors="replace",
                 timeout=timeout_seconds,
                 check=False,
+                cwd=str(cwd) if cwd else None,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeBridgeError(f"无法执行 Antigravity CLI: {exc}") from exc
@@ -77,12 +78,16 @@ class AgyClient:
         effort=None,
         agent=None,
         timeout_seconds=300,
+        project_path=None,
+        new_project=False,
     ):
         arguments = ["-p", prompt, "--output-format", "json"]
         if conversation_id:
             arguments.append(f"--conversation={conversation_id}")
         if project_id:
             arguments.append(f"--project={project_id}")
+        if new_project:
+            arguments.append("--new-project")
         if model:
             arguments.extend(["--model", model])
         if effort:
@@ -90,7 +95,12 @@ class AgyClient:
         if agent:
             arguments.extend(["--agent", agent])
         arguments.extend(["--print-timeout", f"{timeout_seconds}s"])
-        raw = self.invoke(arguments, timeout_seconds=timeout_seconds + 10)
+        cwd = None
+        if project_path:
+            cwd = Path(project_path).expanduser().resolve()
+            if not cwd.is_dir():
+                raise RuntimeBridgeError(f"项目目录不存在或不是目录: {cwd}")
+        raw = self.invoke(arguments, timeout_seconds=timeout_seconds + 10, cwd=cwd)
         try:
             result = json.loads(raw)
         except json.JSONDecodeError as exc:

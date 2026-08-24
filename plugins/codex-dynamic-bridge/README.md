@@ -106,7 +106,7 @@ python -m bridge.cli doctor
 2. **Antigravity CLI (`agy`)**：按项目、模型和 effort 新建或继续 headless 会话，并返回结构化 JSON。
 3. **Companion Sidecar**：通过官方 `agentapi` 新建/发送，接收 Hook 完成事件并管理计划任务。
 
-需要监工、立即追加补充或第一时间处理审批时，桌面页运行中优先使用 Desktop CDP 的 `open-new`/`send-now`；它们在 UI 接受输入后立即返回，Codex 可马上等待 Hook。Companion/`agy` 适合无需实时干预的 headless 任务。
+需要监工或中途追加时，`conversation send --backend auto` 会在发现桌面会话后强制走 Desktop CDP 的 `Send Now`，不会把补充留在 Sidecar 队列；也可以直接使用 `conversation send-now`。只有显式指定 Sidecar，或目标没有桌面页面时才走 Sidecar/`agy`。
 
 未安装可选后端时，`doctor` 会报告能力缺口。只有用户明确要求使用本插件完成任务并授权完整装载时，Agent 才可执行 `setup ensure --confirm-setup`；普通发现或只读请求不能触发安装。写操作开始后不会跨后端自动重试。
 
@@ -169,7 +169,7 @@ codex plugin list --json --marketplace codex-dynamic-bridge --available
 
 只读请求不需要提供 CSS 选择器。多个会话同时存在时，插件会检查焦点；若仍无法唯一确定目标，会要求选择 conversation ID。
 
-普通用户无需创建命令示例中的 `prompt.txt` / `supplement.txt`；Agent 直接把用户文本作为 UTF-8 标准输入传给 `--prompt-stdin`。可直接说“无会话时从唯一可信客户端页面新建并发送此任务”或“把此补充立即发送到当前执行，不要排队”，并明确授权本次发送。
+普通用户无需创建命令示例中的 `prompt.txt` / `supplement.txt`；Agent 直接把用户文本作为 UTF-8 标准输入传给 `--prompt-stdin`。可直接说“无会话时从唯一可信客户端页面新建并发送此任务”或“把此补充立即发送到当前执行，不要排队”，并明确授权本次发送。停止后的旧会话使用 `conversation resume`，不要把旧 ID 交给 Sidecar 重试。
 
 ### 监工模式
 
@@ -194,8 +194,11 @@ python -m bridge.cli discover-pages
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
 Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 
-# 新建、继续和等待会话；提示词优先通过标准输入传入
+# 新建、继续、恢复和等待会话；提示词优先通过标准输入传入
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-id <project-id> --model <slug> --effort high --confirm-create
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-path F:\work\my-project --new-project --confirm-create
+Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send --conversation-id <id> --backend auto --prompt-stdin --confirm-send
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation resume --conversation-id <id> --prompt-stdin --confirm-send
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
 python -m bridge.cli conversation wait --conversation-id <id>
 
@@ -283,7 +286,7 @@ python -m bridge.cli discover
 # 检查页面状态
 python -m bridge.cli control inspect --id <conversation-id>
 
-# 读取完整可见文本，默认读取 body
+# 读取会话正文；默认只返回 User/Agent 消息，排除侧栏和历史会话
 python -m bridge.cli control read --id <conversation-id>
 
 # 缩小读取范围
@@ -397,7 +400,7 @@ python -c "import playwright; print('Playwright OK')"
 
 **客户端运行但没有会话 / 补充消息一直排队 / 收不到审批事件**
 
-无会话时运行 `discover-pages` 并从唯一可信外壳执行带提示词的 `conversation open-new`。会话运行中使用 `conversation send-now`，它按正文关联 `Send Now` 并验证队列项消失。审批链路需先全局安装 Companion 并重启一次 Antigravity；投递任务后主动运行 `event wait-approval`。
+无会话时运行 `discover-pages` 并从唯一可信外壳执行带提示词的 `conversation open-new`。会话运行中使用 `conversation send --backend auto` 或 `conversation send-now`，它们按正文关联 `Send Now` 并验证队列项消失；停止后的会话使用 `conversation resume`。审批链路需先全局安装 Companion 并重启一次 Antigravity；投递任务后主动运行 `event wait-approval`。若 hook 路径曾指向 `.codex-dynamic-bridge.*.tmp`，重新运行一次全局 Companion 安装修复稳定路径，再重启 Antigravity。
 
 **选择器不唯一**
 
@@ -709,7 +712,7 @@ Success criteria: `companion status` reports `installed`, `enabled`, `endpointRe
 Use Codex Dynamic Bridge to sync Sidecar Hook events and list the latest 10; do not modify the Antigravity conversation.
 ```
 
-This uses Antigravity's official global plugin discovery instead of version-sensitive hot injection into Electron, and it never closes or restarts Antigravity automatically. Ordinary lifecycle event delivery fails open. `PreToolUse` matches only `run_command|ask_permission` and always returns Antigravity's `ask` decision, even when reporting fails; it never returns `allow` to bypass permissions. Hooks persist only allowlisted fields such as conversation ID, tool name, and approval state, never complete command arguments. To remove it, first tell Codex, "Use Codex Dynamic Bridge to uninstall the global Companion; I authorize this uninstall," or run this from the source plugin directory:
+This uses Antigravity's official global plugin discovery instead of version-sensitive hot injection into Electron, and it never closes or restarts Antigravity automatically. Hook commands are written after the staged directory is moved to its final stable path, so reinstalling no longer leaves dead `.tmp` hook paths. Ordinary lifecycle event delivery fails open. `PreToolUse` matches only `run_command|ask_permission` and always returns Antigravity's `ask` decision, even when reporting fails; it never returns `allow` to bypass permissions. Hooks persist only allowlisted fields such as conversation ID, tool name, and approval state, never complete command arguments. To remove it, first tell Codex, "Use Codex Dynamic Bridge to uninstall the global Companion; I authorize this uninstall," or run this from the source plugin directory:
 
 ```powershell
 python -m bridge.cli companion uninstall-global --confirm-uninstall

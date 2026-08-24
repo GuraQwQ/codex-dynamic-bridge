@@ -55,7 +55,7 @@ python -m bridge.cli companion uninstall-global --confirm-uninstall
 2. `agy`：指定项目、模型、effort 的结构化 headless 会话。
 3. Desktop CDP：当前页面读取、可访问性快照和语义 UI 控制。
 
-如果用户要求监工、立即追加补充或第一时间处理审批，且 Antigravity 桌面页正在运行，优先使用 Desktop CDP 的 `open-new`/`send-now`，因为它们在 UI 已接受输入后立即返回，Codex 才能紧接着运行 `event wait-approval`。Companion/`agy` 适合不需要实时干预的 headless 任务；不要让一个可能阻塞到回合结束的 headless 调用占住唯一等待通道。
+如果用户要求监工或中途追加，且目标桌面会话正在运行，必须使用 `conversation send --backend auto` 或 `conversation send-now`；`auto` 会检测到桌面页面后强制走 `Send Now`，不能改用 Sidecar 排队。只有用户明确指定 `--backend sidecar` 或目标没有桌面页面时，才使用 Sidecar/`agy`。Companion/`agy` 适合不需要实时干预的 headless 任务。
 
 写操作一旦开始，不要因失败自动切换后端重试；错误可能发生在后置验证阶段，而动作本身已经生效。
 
@@ -71,7 +71,7 @@ python -m bridge.cli control inspect --id <id>
 
 ## 只读操作
 
-用户明确要求读取、总结或检查会话正文时，该请求本身即授权读取所选会话的完整可见文本：
+用户明确要求读取、总结或检查会话正文时，该请求本身即授权读取所选会话的可见文本。`control read`/`snapshot` 省略选择器时只读取 User/Agent 消息 article 和相关控件，自动排除侧栏、项目列表、菜单、历史会话和无关 DOM；只有用户显式传入 `--selector body` 才读取整页：
 
 ```powershell
 python -m bridge.cli control read --id <id>
@@ -100,13 +100,22 @@ python -m bridge.cli artifact list --conversation-id <id>
 
 ## 会话、模型和项目
 
-结构化新建或继续会话：
+结构化新建、继续或恢复会话：
 
 ```powershell
 python -m bridge.cli conversation new --prompt-stdin --project-id <project> --model <slug> --effort high --confirm-create
 python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
+python -m bridge.cli conversation resume --conversation-id <id> --prompt-stdin --confirm-send
 python -m bridge.cli conversation wait --conversation-id <id>
 ```
+
+用户已有项目目录时，使用 `agy` 的工作目录和新项目开关，不能只把本地路径当作 `project-id`：
+
+```powershell
+python -m bridge.cli conversation new --prompt-stdin --project-path <absolute-project-directory> --new-project --confirm-create
+```
+
+`--project-path` 必须是已存在的目录；插件会把它作为 `agy` 子进程的 `cwd`，不会替用户创建或移动目录。
 
 桌面会话仍在执行时，Codex 的补充信息必须立即注入，不要留到当前回合结束后。用户明确授权发送该补充后执行：
 
@@ -114,7 +123,7 @@ python -m bridge.cli conversation wait --conversation-id <id>
 python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 ```
 
-该工作流先把消息加入当前会话，再按正文关联唯一 `Send Now` 按钮并立即发送；会验证对应队列项消失。命令失败时动作可能已经生效，不得重试。
+该工作流先把消息加入当前会话，再按正文关联唯一 `Send Now` 按钮并立即发送；会验证对应队列项消失。`conversation send --backend auto` 在发现桌面会话时自动使用同一工作流。命令失败时动作可能已经生效，不得重试。
 
 桌面工作流：
 
@@ -187,5 +196,5 @@ python -m bridge.cli control select-role --id <id> --role combobox --name <name>
 - 不读取无关会话、账号凭据或模型内部状态。
 - 缺少 Playwright、`agy` 或 Sidecar 时报告能力缺口；只有用户明确要求插件完成任务并授权完整装载时，才可运行 `setup ensure --confirm-setup`。
 - 全局 Companion 安装和卸载分别需要 `--confirm-install` 与 `--confirm-uninstall`；不得仅凭 Sidecar 缺失就自动修改 Antigravity 配置。
-- 正在运行的会话收到补充信息时优先使用 `conversation send-now`；不要把补充留在 `Queued Messages` 等待会话结束。
+- 正在运行的会话收到补充信息时使用 `conversation send --backend auto` 或 `conversation send-now`；不要使用默认 Sidecar `conversation send` 让补充留在 `Queued Messages` 等待会话结束。
 - 自动批准只适用于用户明确授权的当前可见命令；设置了 Companion 或 `--confirm-approval` 本身不构成批准任意命令的授权。
