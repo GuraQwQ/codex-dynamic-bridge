@@ -5,6 +5,12 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 
+# Antigravity 的 Hook 协议固定使用 UTF-8；Windows 管道默认可能是 GBK。
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 EVENT_FIELDS = {
     "conversationId",
     "workspacePaths",

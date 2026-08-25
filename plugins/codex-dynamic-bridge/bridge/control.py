@@ -296,6 +296,7 @@ def approval_dialog_snapshot(page):
                 '是否允许运行此命令',
                 '允许运行此命令',
                 'Allow this command',
+                'Allow running this command?',
                 'permission to run this command'
             ];
             const visible = element => {
@@ -609,10 +610,11 @@ def perform_workflow(page, args):
         ]
         if len(matching_options) != 1:
             raise ControlError("审批选项与指定 decision 不唯一匹配")
-        option = page.get_by_text(args.option_name, exact=True)
+        option = page.get_by_role("radio", name=args.option_name, exact=True)
         if option.count() != 1:
-            raise ControlError("审批选项文本必须唯一匹配")
-        option.nth(0).click(timeout=args.timeout_ms)
+            raise ControlError("审批单选项必须唯一匹配")
+        if not matching_options[0].get("checked"):
+            option.nth(0).check(timeout=args.timeout_ms)
         if args.button_name not in before_approval.get("buttons", []):
             raise ControlError(
                 f"审批按钮不在当前对话框中: {args.button_name}; "
