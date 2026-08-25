@@ -815,6 +815,8 @@ def desktop_conversation_command(args):
 
 
 def project_command(args):
+    if args.project_action == "list":
+        return run_desktop_workflow(args, "project-list")
     if not args.confirm_project:
         raise BridgeError("项目切换或新建向导会改变 Antigravity 页面；请传入 --confirm-project")
     workflow = "project-open" if args.project_action == "open" else "project-new"
@@ -1071,6 +1073,7 @@ def build_parser():
     open_new_prompt = open_new_parser.add_mutually_exclusive_group(required=True)
     open_new_prompt.add_argument("--prompt")
     open_new_prompt.add_argument("--prompt-stdin", action="store_true")
+    open_new_parser.add_argument("--project-id", help="在已创建的桌面项目中创建会话")
     open_new_parser.add_argument("--confirm-conversation", action="store_true")
     open_new_parser.set_defaults(func=desktop_conversation_command)
 
@@ -1227,9 +1230,14 @@ def build_parser():
 
     project_parser = subparsers.add_parser("project", help="控制桌面项目入口")
     project_subparsers = project_parser.add_subparsers(dest="project_action", required=True)
+    project_list_parser = project_subparsers.add_parser("list", help="列出桌面已创建项目及其 ID")
+    add_desktop_workflow_arguments(project_list_parser)
+    project_list_parser.set_defaults(func=project_command)
     project_open_parser = project_subparsers.add_parser("open", help="打开指定项目")
     add_desktop_workflow_arguments(project_open_parser)
-    project_open_parser.add_argument("--name", required=True)
+    project_target = project_open_parser.add_mutually_exclusive_group(required=True)
+    project_target.add_argument("--project-id")
+    project_target.add_argument("--name")
     project_open_parser.add_argument("--confirm-project", action="store_true")
     project_open_parser.set_defaults(func=project_command)
     project_new_parser = project_subparsers.add_parser("new", help="打开新建项目向导")

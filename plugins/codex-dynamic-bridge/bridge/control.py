@@ -288,6 +288,64 @@ def click_first_named(page, names, timeout_ms):
     raise ControlError(f"未找到唯一入口: {' / '.join(names)}")
 
 
+def desktop_projects(page, timeout_ms, settle_ms):
+    headers = None
+    for name in ("项目列表", "Projects"):
+        candidate = page.get_by_role("button", name=name, exact=True)
+        if candidate.count() == 1:
+            headers = candidate
+            break
+    if headers is None:
+        raise ControlError("找不到唯一的项目列表入口")
+
+    header = headers.nth(0)
+    if header.get_attribute("aria-expanded") != "true":
+        header.click(timeout=timeout_ms)
+        page.wait_for_timeout(settle_ms)
+
+    links = page.get_by_role(
+        "link", name="New Conversation in Project", exact=True
+    )
+    projects = links.evaluate_all(
+        """links => links.map(link => {
+            const container = link.parentElement?.parentElement;
+            const button = container?.querySelector('button');
+            const href = link.getAttribute('href') || '';
+            return {
+                name: (button?.innerText || button?.getAttribute('aria-label') || '').trim(),
+                projectId: new URL(href, location.href).searchParams.get('section')
+            };
+        })"""
+    )
+    if any(not project["name"] or not project["projectId"] for project in projects):
+        raise ControlError("项目列表包含无法识别的名称或 ID")
+    return links, projects
+
+
+def open_desktop_project(page, timeout_ms, settle_ms, project_id=None, name=None):
+    links, projects = desktop_projects(page, timeout_ms, settle_ms)
+    matches = [
+        (index, project)
+        for index, project in enumerate(projects)
+        if (project_id and project["projectId"] == project_id)
+        or (not project_id and project["name"] == name)
+    ]
+    if len(matches) != 1:
+        target = f"ID {project_id}" if project_id else f"名称 {name}"
+        raise ControlError(f"项目必须唯一匹配，{target} 实际匹配 {len(matches)} 个")
+    index, project = matches[0]
+    links.nth(index).click(timeout=timeout_ms)
+    page.wait_for_url(
+        lambda url: (
+            trusted_page_url(url)
+            and conversation_id_from_url(url) is None
+            and parse_qs(urlparse(url).query).get("section") == [project["projectId"]]
+        ),
+        timeout=timeout_ms,
+    )
+    return project
+
+
 def approval_dialog_snapshot(page):
     """只读取当前权限对话框；内容不写入事件或任务账本。"""
     return page.evaluate(
@@ -451,17 +509,23 @@ def perform_workflow(page, args):
     detail = {}
     if action == "conversation-new":
         previous_id = conversation_id_from_url(page.url)
-        new_button, _, _ = resolve_role_target(
-            page,
-            "button",
-            "New Conversation",
-            exact=True,
-        )
-        new_button.click(timeout=args.timeout_ms)
-        page.wait_for_url(
-            lambda url: trusted_page_url(url) and conversation_id_from_url(url) is None,
-            timeout=args.timeout_ms,
-        )
+        project_id = getattr(args, "project_id", None)
+        if project_id:
+            detail["project"] = open_desktop_project(
+                page, args.timeout_ms, args.settle_ms, project_id=project_id
+            )
+        else:
+            new_button, _, _ = resolve_role_target(
+                page,
+                "button",
+                "New Conversation",
+                exact=True,
+            )
+            new_button.click(timeout=args.timeout_ms)
+            page.wait_for_url(
+                lambda url: trusted_page_url(url) and conversation_id_from_url(url) is None,
+                timeout=args.timeout_ms,
+            )
         input_target, _, _ = resolve_role_target(
             page,
             "combobox",
@@ -540,17 +604,28 @@ def perform_workflow(page, args):
             page.keyboard.press("Escape")
             detail["changed"] = False
         detail.update({"before": current, "model": args.model})
-    elif action == "project-open":
-        click_first_named(page, ("项目列表", "Projects"), args.timeout_ms)
-        page.wait_for_timeout(args.settle_ms)
-        unique_text_target(page, args.name, exact=True).click(timeout=args.timeout_ms)
-        detail["project"] = args.name
-    elif action == "project-new":
-        click_first_named(page, ("项目列表", "Projects"), args.timeout_ms)
-        page.wait_for_timeout(args.settle_ms)
-        detail["entry"] = click_first_named(
-            page, ("新建项目", "New Project"), args.timeout_ms
+    elif action == "project-list":
+        _, detail["projects"] = desktop_projects(
+            page, args.timeout_ms, args.settle_ms
         )
+    elif action == "project-open":
+        detail["project"] = open_desktop_project(
+            page,
+            args.timeout_ms,
+            args.settle_ms,
+            project_id=args.project_id,
+            name=args.name,
+        )
+    elif action == "project-new":
+        desktop_projects(page, args.timeout_ms, args.settle_ms)
+        for name in ("新建项目", "Create New Project", "New Project"):
+            target = page.get_by_role("button", name=name, exact=True)
+            if target.count() == 1:
+                target.nth(0).click(timeout=args.timeout_ms)
+                detail["entry"] = name
+                break
+        else:
+            raise ControlError("找不到唯一的新建项目入口")
     elif action in {"settings-open", "settings-read", "settings-set"}:
         page.keyboard.press("Control+Comma")
         page.wait_for_timeout(args.settle_ms)

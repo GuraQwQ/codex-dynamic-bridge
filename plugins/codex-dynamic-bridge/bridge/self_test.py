@@ -19,6 +19,7 @@ class FakeTarget:
         self.clicked = False
         self.pressed = None
         self.waited = None
+        self.project = None
 
     def evaluate(self, _):
         if "element => ({tag:" in _:
@@ -96,6 +97,9 @@ class FakeLocator:
         if 0 <= index < len(self.targets):
             return self.targets[index]
         return self.placeholder
+
+    def evaluate_all(self, _):
+        return [target.project for target in self.targets if target.project]
 
 
 class FakeControlSummaryLocator:
@@ -560,6 +564,54 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(result["detail"]["conversationId"], "new-conversation")
         self.assertEqual(result["detail"]["promptLength"], 5)
 
+    def test_desktop_列出项目并按_id_创建会话(self):
+        projects = FakeTarget("Projects")
+        projects.aria_expanded = "true"
+        first_link = FakeTarget()
+        first_link.project = {"name": "同名项目", "projectId": "project-1"}
+        second_link = FakeTarget()
+        second_link.project = {"name": "同名项目", "projectId": "project-2"}
+        message_input = FakeTarget()
+        send_button = FakeTarget()
+        page = FakePage(
+            [],
+            role_targets={
+                ("button", "Projects"): [projects],
+                ("link", "New Conversation in Project"): [first_link, second_link],
+                ("combobox", "Message input"): [message_input],
+                ("button", "Send message"): [send_button],
+            },
+        )
+
+        listed = control.perform_workflow(
+            page,
+            argparse.Namespace(
+                workflow_action="project-list", timeout_ms=1200, settle_ms=10
+            ),
+        )
+        self.assertEqual(
+            listed["detail"]["projects"],
+            [first_link.project, second_link.project],
+        )
+
+        page.url_sequence = [
+            "https://127.0.0.1:3900/?section=project-2",
+            "https://127.0.0.1:3900/c/new-conversation?section=project-2",
+        ]
+        created = control.perform_workflow(
+            page,
+            argparse.Namespace(
+                workflow_action="conversation-new",
+                prompt="执行新任务",
+                project_id="project-2",
+                timeout_ms=1200,
+                settle_ms=10,
+            ),
+        )
+        self.assertEqual(second_link.clicked, 1200)
+        self.assertEqual(created["detail"]["project"], second_link.project)
+        self.assertEqual(created["detail"]["conversationId"], "new-conversation")
+
     def test_open_new_无需会话_id_并传递可信页面_url(self):
         target = {
             "kind": "shell",
@@ -596,10 +648,13 @@ class BridgeTestCase(unittest.TestCase):
                 "open-new",
                 "--prompt",
                 "执行任务",
+                "--project-id",
+                "project-1",
                 "--confirm-conversation",
             ]
         )
         self.assertIsNone(parsed.id)
+        self.assertEqual(parsed.project_id, "project-1")
 
     def test_desktop_设置布尔值(self):
         target = FakeTarget()

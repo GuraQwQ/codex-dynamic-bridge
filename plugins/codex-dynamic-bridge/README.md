@@ -191,6 +191,8 @@ python -m bridge.cli setup ensure --confirm-setup
 python -m bridge.cli discover-pages
 
 # 无会话时从唯一可信外壳创建首个任务；运行中立即追加补充
+python -m bridge.cli project list --id <id>
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --project-id <project-id> --prompt-stdin --confirm-conversation
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
 Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 
@@ -210,7 +212,7 @@ python -m bridge.cli conversation cancel --id <id> --confirm-conversation
 python -m bridge.cli model list
 python -m bridge.cli model desktop-list --id <id>
 python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
-python -m bridge.cli project open --id <id> --name <project-name> --confirm-project
+python -m bridge.cli project open --id <id> --project-id <project-id> --confirm-project
 python -m bridge.cli project new --id <id> --confirm-project
 
 # 设置、用量、产物、活动和任务映射
@@ -637,6 +639,8 @@ python -m bridge.cli setup ensure --confirm-setup
 python -m bridge.cli discover-pages
 
 # Create the first task from a trusted shell; inject a supplement while a task is running
+python -m bridge.cli project list --id <id>
+Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --project-id <project-id> --prompt-stdin --confirm-conversation
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
 Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 
@@ -653,7 +657,7 @@ python -m bridge.cli conversation cancel --id <id> --confirm-conversation
 python -m bridge.cli model list
 python -m bridge.cli model desktop-list --id <id>
 python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
-python -m bridge.cli project open --id <id> --name <project-name> --confirm-project
+python -m bridge.cli project open --id <id> --project-id <project-id> --confirm-project
 python -m bridge.cli project new --id <id> --confirm-project
 
 # Settings, usage, artifacts, activity, and task mappings

@@ -128,13 +128,15 @@ python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-se
 桌面工作流：
 
 ```powershell
+python -m bridge.cli project list --id <id>
+python -m bridge.cli conversation open-new --project-id <project> --prompt-stdin --confirm-conversation
 python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
 python -m bridge.cli conversation switch --id <id> --target <title> --confirm-conversation
 python -m bridge.cli conversation rename --id <id> --name <name> --confirm-conversation
 python -m bridge.cli conversation fork --id <id> --project-id <project> --confirm-conversation
 python -m bridge.cli conversation cancel --id <id> --confirm-conversation
 python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
-python -m bridge.cli project open --id <id> --name <project> --confirm-project
+python -m bridge.cli project open --id <id> --project-id <project> --confirm-project
 python -m bridge.cli project new --id <id> --confirm-project
 ```
 
