@@ -19,8 +19,8 @@ python -m bridge.cli companion install-global --confirm-install
 `~/.gemini/config/plugins/codex-dynamic-bridge`，并在 `~/.gemini/config/config.json`
 中合并 `codex-dynamic-bridge/codex-bridge` 的 `enabled` 与 `projectId`。默认使用官方
 `default-cli-project`；其他配置保持不变；
-以后打开任何工作区都不需要重复安装。Antigravity 正在运行时，命令会返回
-`restartRequired: true`，但不会自行关闭或重启应用。
+以后打开任何工作区都不需要重复安装。文件和配置相同时直接返回 `updated: false`；
+已有 Companion 需要更新但 Antigravity 正在运行时，安装器保持零修改并要求完全退出后重试。
 
 卸载命令只删除本插件和对应 Sidecar 配置项：
 
@@ -51,8 +51,9 @@ The installer detects a running Antigravity instance, atomically replaces the fi
 official global directory `~/.gemini/config/plugins/codex-dynamic-bridge`, and merges only the
 `codex-dynamic-bridge/codex-bridge` entry in `~/.gemini/config/config.json`, using the documented
 `default-cli-project` by default. Every workspace then
-shares this Companion. A running application produces `restartRequired: true`; the installer never
-closes or restarts Antigravity itself.
+shares this Companion. Identical files and configuration return `updated: false`. If an installed
+Companion needs an update while Antigravity is running, the installer makes no changes and asks the
+user to fully exit before retrying.
 
 Uninstall removes only this plugin and its Sidecar entry:
 

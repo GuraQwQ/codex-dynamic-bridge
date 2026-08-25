@@ -258,7 +258,7 @@ python -m bridge.cli companion install-global --confirm-install
 
 Sidecar 使用 Antigravity 官方 `agentapi`，只绑定 `127.0.0.1`，每次启动生成随机令牌。默认项目是官方定义的 `default-cli-project`；需要绑定其他已知项目时才追加 `--project-id <project-id>`。一次配置后，所有 Antigravity 工作区共用该全局 Companion，不必重复复制插件。
 
-如果 Antigravity 正在运行，安装结果为 `restartRequired: true`；未运行时为 `false`。完成当前工作后完全退出所有 Antigravity 进程，再启动一次，然后让 Codex “检查 Codex Dynamic Bridge 的 Companion 和 doctor 状态”，或在源码插件目录运行：
+安装器是幂等的：文件和配置相同时返回 `updated: false`，无需重启。已有 Companion 需要更新但 Antigravity 正在运行时，安装器会保持零修改并要求完全退出后重试；全新安装到运行中的 Antigravity 时可能返回 `restartRequired: true`。不要让 Codex 代替你关闭应用。重新启动后，可让 Codex “检查 Codex Dynamic Bridge 的 Companion 和 doctor 状态”，或在源码插件目录运行：
 
 ```powershell
 python -m bridge.cli companion status
@@ -703,7 +703,7 @@ python -m bridge.cli companion install-global --confirm-install
 
 The Sidecar uses Antigravity's official `agentapi`, binds only to `127.0.0.1`, and generates a random token at every start. It uses Antigravity's documented `default-cli-project` by default; append `--project-id <project-id>` only for another known project. Once configured, every Antigravity workspace shares this global Companion; no repeated plugin copy is needed.
 
-If Antigravity is running, installation returns `restartRequired: true`; when it is stopped, the value is `false`. Finish current work, fully exit every Antigravity process, launch it once, then ask Codex to "check the Codex Dynamic Bridge Companion and doctor status," or run these commands from the source plugin directory:
+The installer is idempotent: identical files and configuration return `updated: false` without requiring a restart. If an installed Companion needs an update while Antigravity is running, installation makes no changes and asks you to fully exit before retrying; a fresh install into a running Antigravity may return `restartRequired: true`. Codex must not close the app for you. After relaunching, ask Codex to "check the Codex Dynamic Bridge Companion and doctor status," or run these commands from the source plugin directory:
 
 ```powershell
 python -m bridge.cli companion status

@@ -39,7 +39,7 @@ python -m bridge.cli companion install-global --confirm-install
 python -m bridge.cli companion install-global --project-id <project-id> --confirm-install
 ```
 
-安装器会自动检测 Antigravity 是否正在运行，并使用官方全局插件目录；不要为每个工作区重复安装，也不要对 Electron 进程做热注入。返回 `restartRequired: true` 时提示用户在完成当前工作后重启一次，不要代替用户关闭或重启应用。
+安装器会自动检测 Antigravity 是否正在运行，并使用官方全局插件目录；相同文件和配置会直接返回 `updated: false`。已有 Companion 需要更新但 Antigravity 正在运行时，安装器会零修改拒绝并要求完全退出后重试；不要为每个工作区重复安装，也不要对 Electron 进程做热注入。返回 `restartRequired: true` 时提示用户在完成当前工作后重启一次，不要代替用户关闭或重启应用。
 
 用户明确要求卸载全局 Companion 时执行：
 

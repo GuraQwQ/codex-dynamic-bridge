@@ -174,6 +174,27 @@ def staged_plugin(destination, endpoint=None):
     return stage
 
 
+def source_matches(destination):
+    source = source_plugin()
+    def files(root, generated_hooks=False):
+        return {
+            path.relative_to(root): path
+            for path in root.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and "data" not in path.relative_to(root).parts
+            and path.suffix != ".pyc"
+            and not (generated_hooks and path.relative_to(root) == Path("hooks.json"))
+        }
+
+    source_files = files(source)
+    installed_files = files(destination, generated_hooks=True)
+    return source_files.keys() == installed_files.keys() and all(
+        installed_files[relative].read_bytes() == path.read_bytes()
+        for relative, path in source_files.items()
+    )
+
+
 def status(env=None):
     root = config_root(env)
     destination = destination_plugin(env)
@@ -213,6 +234,13 @@ def install_global(project_id, env=None):
         "projectId": project_id.strip(),
     }
 
+    if destination.exists() and source_matches(destination) and updated == config:
+        result = status(env)
+        result.update({"updated": False, "restartRequired": False})
+        return result
+    if destination.exists() and desktop_running(env):
+        raise CompanionError("Antigravity 正在运行且 Companion 有更新；请完全退出后重试安装")
+
     stage = staged_plugin(destination, endpoint_file(env))
     backup = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.backup"
     had_destination = destination.exists()
@@ -239,6 +267,7 @@ def install_global(project_id, env=None):
         shutil.rmtree(backup, ignore_errors=True)
 
     result = status(env)
+    result["updated"] = True
     result["restartRequired"] = result["antigravityRunning"]
     return result
 

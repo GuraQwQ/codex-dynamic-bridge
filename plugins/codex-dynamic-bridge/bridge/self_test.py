@@ -1032,6 +1032,24 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(config["theme"], "dark")
         self.assertEqual(config["sidecars"]["other/worker"], {"enabled": False})
 
+    def test_companion_运行时相同版本直接成功且有更新时要求退出(self):
+        home = Path(self.temporary_directory.name) / "home"
+        env = {"USERPROFILE": str(home)}
+        first = companion.install_global("project-1", env)
+        destination = Path(first["destination"])
+
+        with mock.patch.object(companion, "desktop_running", return_value=True):
+            unchanged = companion.install_global("project-1", env)
+        self.assertFalse(unchanged["updated"])
+        self.assertFalse(unchanged["restartRequired"])
+
+        stale = destination / "stale.py"
+        stale.write_text("旧文件\n", encoding="utf-8")
+        with mock.patch.object(companion, "desktop_running", return_value=True):
+            with self.assertRaisesRegex(companion.CompanionError, "完全退出后重试"):
+                companion.install_global("project-1", env)
+        self.assertEqual(stale.read_text(encoding="utf-8"), "旧文件\n")
+
     def test_companion_卸载只删除自己的配置和目录(self):
         home = Path(self.temporary_directory.name) / "home"
         env = {"USERPROFILE": str(home)}
