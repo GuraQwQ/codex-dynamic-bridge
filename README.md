@@ -206,12 +206,13 @@ python -m bridge.cli setup ensure --confirm-setup
 
 # 即使尚无会话，也发现可信 Antigravity 外壳页并从中创建第一个任务
 python -m bridge.cli discover-pages
+python -m bridge.cli project list
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
 
 # 新建、继续和等待会话；提示词优先通过标准输入传入
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-id <project-id> --model <slug> --effort high --confirm-create
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
-python -m bridge.cli conversation wait --conversation-id <id>
+python -m bridge.cli conversation wait --conversation-id <id> --after <observedAt>
 
 # 桌面会话、模型和项目
 python -m bridge.cli conversation switch --id <id> --target <title> --confirm-conversation
@@ -221,8 +222,8 @@ python -m bridge.cli conversation cancel --id <id> --confirm-conversation
 python -m bridge.cli model list
 python -m bridge.cli model desktop-list --id <id>
 python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
-python -m bridge.cli project open --id <id> --name <project-name> --confirm-project
-python -m bridge.cli project new --id <id> --confirm-project
+python -m bridge.cli project open --name <project-name> --confirm-project
+python -m bridge.cli project new --confirm-project
 
 # 设置、用量、产物、活动和任务映射
 python -m bridge.cli settings read --id <id>
@@ -341,7 +342,7 @@ python -m bridge.cli sync --source .\external-links.json
 - 用户明确要求读取、总结或检查会话正文时，插件可读取所选会话的完整可见文本，无需额外选择器。
 - `click`、`fill` 和 `press` 只有在用户明确授权当前具体动作后才能使用 `--confirm-control`。
 - 会话、模型、项目、设置、产物和计划任务分别使用 `--confirm-create/send/conversation/model/project/settings/artifact/schedule`，授权不可互换。
-- 审批响应必须先取得唯一 `PreToolUse` 事件并只读检查当前对话框，再用精确按钮名、工具名、事件时间和 `--confirm-approval` 绑定本次点击；没有用户对当前可见命令的明确授权时只能通知，不能自动批准。
+- 审批响应必须先取得唯一 `PreToolUse` 事件并只读检查当前对话框，再用精确按钮名、工具名、事件时间和 `--confirm-approval` 绑定本次点击；用户可明确授权当前命令，也可授权监工在限定任务范围内自主判断并审批，除此之外只能通知。
 - 插件不提供任意 JavaScript、任意导航、关闭页面、文件上传或下载命令。
 - 插件只连接 `127.0.0.1`、`localhost` 或 `::1` 上的 Antigravity 会话。
 - 页面修改命令返回错误并不能证明页面完全没有发生变化，因此插件不会自动重试写操作。
@@ -674,12 +675,13 @@ python -m bridge.cli setup ensure --confirm-setup
 
 # Discover a trusted Antigravity shell and create the first task even when no conversation exists
 python -m bridge.cli discover-pages
+python -m bridge.cli project list
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
 
 # Create, continue, and wait; prefer standard input for prompts
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation new --prompt-stdin --project-id <project-id> --model <slug> --effort high --confirm-create
 Get-Content -Raw .\prompt.txt | python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
-python -m bridge.cli conversation wait --conversation-id <id>
+python -m bridge.cli conversation wait --conversation-id <id> --after <observedAt>
 
 # Desktop conversations, models, and projects
 python -m bridge.cli conversation switch --id <id> --target <title> --confirm-conversation
@@ -689,8 +691,8 @@ python -m bridge.cli conversation cancel --id <id> --confirm-conversation
 python -m bridge.cli model list
 python -m bridge.cli model desktop-list --id <id>
 python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
-python -m bridge.cli project open --id <id> --name <project-name> --confirm-project
-python -m bridge.cli project new --id <id> --confirm-project
+python -m bridge.cli project open --name <project-name> --confirm-project
+python -m bridge.cli project new --confirm-project
 
 # Settings, usage, artifacts, activity, and task mappings
 python -m bridge.cli settings read --id <id>
@@ -809,7 +811,7 @@ python -m bridge.cli sync --source .\external-links.json
 - When the user explicitly asks to read, summarize, or inspect session content, the plugin may read the complete visible text of the selected session without requiring another selector.
 - `click`, `fill`, and `press` may use `--confirm-control` only after the user authorizes that specific action.
 - Conversations, models, projects, settings, artifacts, and schedules use separate `--confirm-create/send/conversation/model/project/settings/artifact/schedule` flags; authorization is not interchangeable.
-- An approval response must bind a unique `PreToolUse` event to a read-only dialog inspection, exact button name, tool name, event timestamp, and `--confirm-approval`. Without explicit user authorization for the currently visible command, the agent may notify but must not approve it.
+- An approval response must bind a unique `PreToolUse` event to a read-only dialog inspection, exact button name, tool name, event timestamp, and `--confirm-approval`. The user may authorize the current command or explicitly authorize the supervisor to judge commands within a bounded task; otherwise the agent may only notify.
 - The plugin does not expose arbitrary JavaScript, arbitrary navigation, page closing, file upload, or download commands.
 - It only connects to Antigravity sessions on `127.0.0.1`, `localhost`, or `::1`.
 - An error from a mutating command does not prove that the page remained unchanged, so the plugin never retries write actions automatically.

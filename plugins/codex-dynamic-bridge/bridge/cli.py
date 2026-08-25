@@ -494,6 +494,7 @@ def conversation_command(args):
     event_store = EventStore()
     task_store = TaskStore()
     if args.conversation_action == "wait":
+        after = format_timestamp(parse_timestamp(args.after)) if args.after else None
         if args.backend in {"auto", "sidecar"}:
             try:
                 sidecar = SidecarClient()
@@ -502,15 +503,22 @@ def conversation_command(args):
                     sidecar.wait(
                         args.conversation_id,
                         timeout_seconds=args.timeout_seconds,
+                        after=after,
                     )
                 )
             except RuntimeBridgeError:
                 if args.backend == "sidecar":
                     raise
         return print_json(
-            event_store.wait(args.conversation_id, timeout_seconds=args.timeout_seconds)
+            event_store.wait(
+                args.conversation_id,
+                timeout_seconds=args.timeout_seconds,
+                after=after,
+            )
         )
 
+    if args.conversation_action in {"send", "resume"} and not args.confirm_send:
+        raise BridgeError("发送消息会修改会话；请在明确授权后传入 --confirm-send")
     prompt = prompt_from_args(args)
     if args.conversation_action in {"send", "resume"} and args.backend == "auto":
         try:
@@ -521,7 +529,6 @@ def conversation_command(args):
             args.id = args.conversation_id
             args.timeout_ms = min(args.timeout_seconds * 1000, 30000)
             args.settle_ms = 250
-            args.confirm_send = True
             args.prompt = prompt
             args.conversation_action = "send-now"
             return desktop_conversation_command(args)
@@ -559,8 +566,6 @@ def conversation_command(args):
                 new_project=getattr(args, "new_project", False),
             )
     else:
-        if not args.confirm_send:
-            raise BridgeError("发送消息会修改会话；请在明确授权后传入 --confirm-send")
         if backend == "sidecar":
             result = client.send_message(args.conversation_id, prompt)
         else:
@@ -599,7 +604,9 @@ def event_command(args):
     store = EventStore()
     tasks = TaskStore()
     if args.event_action == "sync":
-        imported = store.import_events(SidecarClient().list_events(args.conversation_id))
+        imported = store.import_events(
+            SidecarClient().list_all_events(args.conversation_id)
+        )
         synced_tasks = [tasks.sync_event(event) for event in imported]
         return print_json({"imported": len(imported), "tasks": synced_tasks})
     if args.event_action == "ingest":
@@ -640,8 +647,13 @@ def event_command(args):
                 after=after,
             )
         )
+    after = format_timestamp(parse_timestamp(args.after)) if args.after else None
     return print_json(
-        store.wait(args.conversation_id, timeout_seconds=args.timeout_seconds)
+        store.wait(
+            args.conversation_id,
+            timeout_seconds=args.timeout_seconds,
+            after=after,
+        )
     )
 
 
@@ -756,17 +768,30 @@ def artifact_command(args):
     return print_json({"root": str(root), "path": args.path, "content": content})
 
 
-def run_desktop_workflow(args, workflow_action):
+def run_desktop_workflow(args, workflow_action, allow_shell=False):
     from bridge.control import ControlError, execute_control
 
     args.control_action = "workflow"
     args.workflow_action = workflow_action
-    session = select_sessions(discover_sessions(), args.id)[0]
+    page = select_app_page(discover_app_pages(), args.id) if allow_shell else None
+    session = (
+        {"conversationId": page.get("conversationId")}
+        if page
+        else select_sessions(discover_sessions(), args.id)[0]
+    )
     try:
-        result = execute_control(read_antigravity_port(), session["conversationId"], args)
+        result = execute_control(
+            read_antigravity_port(),
+            session["conversationId"],
+            args,
+            **({"page_url": page["url"]} if page else {}),
+        )
     except ControlError as exc:
         raise BridgeError(str(exc)) from exc
     result["conversationId"] = session["conversationId"]
+    if page:
+        result["sourceDevtoolsId"] = page["devtoolsId"]
+        result["bootstrappedFromShell"] = page["kind"] == "shell"
     return print_json(result)
 
 
@@ -816,11 +841,11 @@ def desktop_conversation_command(args):
 
 def project_command(args):
     if args.project_action == "list":
-        return run_desktop_workflow(args, "project-list")
+        return run_desktop_workflow(args, "project-list", allow_shell=True)
     if not args.confirm_project:
         raise BridgeError("项目切换或新建向导会改变 Antigravity 页面；请传入 --confirm-project")
     workflow = "project-open" if args.project_action == "open" else "project-new"
-    return run_desktop_workflow(args, workflow)
+    return run_desktop_workflow(args, workflow, allow_shell=True)
 
 
 def model_set_command(args):
@@ -1065,6 +1090,7 @@ def build_parser():
     wait_conversation_parser = conversation_subparsers.add_parser("wait", help="等待 Hook 报告会话完全空闲")
     wait_conversation_parser.add_argument("--conversation-id", required=True)
     wait_conversation_parser.add_argument("--backend", choices=("auto", "local", "sidecar"), default="auto")
+    wait_conversation_parser.add_argument("--after", help="仅接受此 ISO 8601 时间之后的完成事件")
     wait_conversation_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=30)
     wait_conversation_parser.set_defaults(func=conversation_command)
 
@@ -1131,6 +1157,7 @@ def build_parser():
     event_list_parser.set_defaults(func=event_command)
     event_wait_parser = event_subparsers.add_parser("wait", help="等待会话 Stop/fullyIdle 事件")
     event_wait_parser.add_argument("--conversation-id", required=True)
+    event_wait_parser.add_argument("--after", help="仅接受此 ISO 8601 时间之后的完成事件")
     event_wait_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=30)
     event_wait_parser.set_defaults(func=event_command)
     event_wait_approval_parser = event_subparsers.add_parser(
@@ -1231,17 +1258,17 @@ def build_parser():
     project_parser = subparsers.add_parser("project", help="控制桌面项目入口")
     project_subparsers = project_parser.add_subparsers(dest="project_action", required=True)
     project_list_parser = project_subparsers.add_parser("list", help="列出桌面已创建项目及其 ID")
-    add_desktop_workflow_arguments(project_list_parser)
+    add_desktop_workflow_arguments(project_list_parser, require_id=False)
     project_list_parser.set_defaults(func=project_command)
     project_open_parser = project_subparsers.add_parser("open", help="打开指定项目")
-    add_desktop_workflow_arguments(project_open_parser)
+    add_desktop_workflow_arguments(project_open_parser, require_id=False)
     project_target = project_open_parser.add_mutually_exclusive_group(required=True)
     project_target.add_argument("--project-id")
     project_target.add_argument("--name")
     project_open_parser.add_argument("--confirm-project", action="store_true")
     project_open_parser.set_defaults(func=project_command)
     project_new_parser = project_subparsers.add_parser("new", help="打开新建项目向导")
-    add_desktop_workflow_arguments(project_new_parser)
+    add_desktop_workflow_arguments(project_new_parser, require_id=False)
     project_new_parser.add_argument("--confirm-project", action="store_true")
     project_new_parser.set_defaults(func=project_command)
 

@@ -106,7 +106,7 @@ python -m bridge.cli artifact list --conversation-id <id>
 python -m bridge.cli conversation new --prompt-stdin --project-id <project> --model <slug> --effort high --confirm-create
 python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
 python -m bridge.cli conversation resume --conversation-id <id> --prompt-stdin --confirm-send
-python -m bridge.cli conversation wait --conversation-id <id>
+python -m bridge.cli conversation wait --conversation-id <id> --after <发送前记录的 ISO 8601 时间>
 ```
 
 用户已有项目目录时，使用 `agy` 的工作目录和新项目开关，不能只把本地路径当作 `project-id`：
@@ -123,12 +123,12 @@ python -m bridge.cli conversation new --prompt-stdin --project-path <absolute-pr
 python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 ```
 
-该工作流先把消息加入当前会话，再按正文关联唯一 `Send Now` 按钮并立即发送；会验证对应队列项消失。`conversation send --backend auto` 在发现桌面会话时自动使用同一工作流。命令失败时动作可能已经生效，不得重试。
+该工作流先把消息加入当前会话，再按正文关联唯一 `Send Now` 按钮并立即发送；会验证对应队列项消失。`conversation send --backend auto` 在发现桌面会话时自动使用同一工作流，但仍要求调用方显式传入 `--confirm-send`。该参数表示 Codex 确认动作处于用户已授权范围内，不要求已经授予监工权限的用户逐条重复确认。命令失败时动作可能已经生效，不得重试。
 
 桌面工作流：
 
 ```powershell
-python -m bridge.cli project list --id <id>
+python -m bridge.cli project list
 python -m bridge.cli conversation open-new --project-id <project> --prompt-stdin --confirm-conversation
 python -m bridge.cli conversation open-new --prompt-stdin --confirm-conversation
 python -m bridge.cli conversation switch --id <id> --target <title> --confirm-conversation
@@ -136,9 +136,11 @@ python -m bridge.cli conversation rename --id <id> --name <name> --confirm-conve
 python -m bridge.cli conversation fork --id <id> --project-id <project> --confirm-conversation
 python -m bridge.cli conversation cancel --id <id> --confirm-conversation
 python -m bridge.cli model set --id <id> --model <visible-name> --confirm-model
-python -m bridge.cli project open --id <id> --project-id <project> --confirm-project
-python -m bridge.cli project new --id <id> --confirm-project
+python -m bridge.cli project open --project-id <project> --confirm-project
+python -m bridge.cli project new --confirm-project
 ```
+
+项目命令省略 `--id` 时会使用唯一可信的 Antigravity 会话或根页面；存在多个页面时仍需用 conversation ID 或 DevTools ID 消除歧义。
 
 模型在当前回合运行期间切换时，只影响后续消息。发送下一条消息前回读模型菜单验证。
 
@@ -166,9 +168,9 @@ python -m bridge.cli task link --conversation-id <id> --codex-task-id <id> --pro
 python -m bridge.cli task list
 ```
 
-事件与任务状态只保存白名单字段；不要把会话正文、Hook 原始 payload、令牌或凭据写入链接和任务账本。
+`event sync` 会使用追加日志行号游标读取全部分页，不再只导入最新 100 条。事件与任务状态只保存白名单字段；不要把会话正文、Hook 原始 payload、令牌或凭据写入链接和任务账本。
 
-投递长任务后主动等待 `PreToolUse` 审批事件，不依赖偶尔读取整页。事件到达后先运行 `approval inspect`，它可返回当前可见命令、选项与提交按钮，但不会持久化命令正文。只有用户明确授权当前可见命令时，才能把事件返回的 `toolName`、`observedAt` 与检查到的精确选项/按钮绑定后响应：
+投递长任务后主动等待 `PreToolUse` 审批事件，不依赖偶尔读取整页。事件到达后先运行 `approval inspect`，它可返回当前可见命令、选项与提交按钮，但不会持久化命令正文。用户明确授权当前命令，或明确授权监工在限定任务范围内自主判断并审批后，才能把事件返回的 `toolName`、`observedAt` 与检查到的精确选项/按钮绑定后响应：
 
 ```powershell
 python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name <toolName> --event-observed-at <observedAt> --confirm-approval

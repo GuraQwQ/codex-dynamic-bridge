@@ -656,6 +656,35 @@ class BridgeTestCase(unittest.TestCase):
         self.assertIsNone(parsed.id)
         self.assertEqual(parsed.project_id, "project-1")
 
+    def test_project_list_可从无会话根页面执行(self):
+        args = cli.build_parser().parse_args(["project", "list"])
+        target = {
+            "kind": "shell",
+            "conversationId": None,
+            "devtoolsId": "shell-1",
+            "title": "Antigravity",
+            "url": "https://127.0.0.1:3900/",
+        }
+        with (
+            mock.patch.object(cli, "discover_app_pages", return_value=[target]),
+            mock.patch.object(cli, "read_antigravity_port", return_value=3000),
+            mock.patch.object(
+                control,
+                "execute_control",
+                return_value={"detail": {"projects": []}},
+            ) as execute,
+        ):
+            result, _ = self.capture(cli.project_command, args)
+        self.assertTrue(result["bootstrappedFromShell"])
+        self.assertEqual(result["sourceDevtoolsId"], "shell-1")
+        self.assertIsNone(result["conversationId"])
+        self.assertEqual(execute.call_args.kwargs["page_url"], target["url"])
+
+        open_args = cli.build_parser().parse_args(
+            ["project", "open", "--project-id", "project-1", "--confirm-project"]
+        )
+        self.assertIsNone(open_args.id)
+
     def test_desktop_设置布尔值(self):
         target = FakeTarget()
         page = FakePage([target])
@@ -810,6 +839,29 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual(result, {"sent": True})
         self.assertEqual(args.id, "conversation-1")
         send_now.assert_called_once_with(args)
+
+    def test_conversation_send_auto_桌面会话也必须显式确认(self):
+        args = cli.build_parser().parse_args(
+            [
+                "conversation",
+                "send",
+                "--conversation-id",
+                "conversation-1",
+                "--prompt",
+                "未经确认的补充",
+            ]
+        )
+        with (
+            mock.patch.object(
+                cli,
+                "discover_sessions",
+                return_value=[{"conversationId": "conversation-1", "devtoolsId": "d"}],
+            ),
+            mock.patch.object(cli, "desktop_conversation_command") as send_now,
+            self.assertRaises(cli.BridgeError),
+        ):
+            cli.conversation_command(args)
+        send_now.assert_not_called()
 
     def test_conversation_resume_解析并要求确认(self):
         parsed = cli.build_parser().parse_args(
@@ -992,6 +1044,104 @@ class BridgeTestCase(unittest.TestCase):
         )
         result = event_store.wait("conversation-1", timeout_seconds=0)
         self.assertTrue(result["fullyIdle"])
+
+    def test_event_wait_忽略时间下界之前的完成事件(self):
+        event_store = state.EventStore(Path(self.temporary_directory.name) / "events.jsonl")
+        event_store.import_events(
+            [
+                {
+                    "kind": "Stop",
+                    "conversationId": "conversation-1",
+                    "fullyIdle": True,
+                    "observedAt": "2026-08-26T00:00:00Z",
+                }
+            ]
+        )
+        with self.assertRaises(state.StateError):
+            event_store.wait(
+                "conversation-1",
+                timeout_seconds=0,
+                after="2026-08-26T00:00:01Z",
+            )
+
+    def test_sidecar_wait_忽略时间下界之前的完成事件(self):
+        client = runtime.SidecarClient()
+        old_event = {
+            "kind": "Stop",
+            "conversationId": "conversation-1",
+            "fullyIdle": True,
+            "observedAt": "2026-08-26T00:00:00Z",
+        }
+        with (
+            mock.patch.object(client, "list_events", return_value=[old_event]),
+            self.assertRaises(runtime.RuntimeBridgeError),
+        ):
+            client.wait(
+                "conversation-1",
+                timeout_seconds=0,
+                after="2026-08-26T00:00:01Z",
+            )
+
+    def test_sidecar_完整分页读取事件(self):
+        responses = iter(
+            [
+                {"events": [{"stepIdx": 0}, {"stepIdx": 1}], "nextCursor": 2, "hasMore": True},
+                {"events": [{"stepIdx": 2}], "nextCursor": 3, "hasMore": False},
+            ]
+        )
+        opened = []
+
+        def opener(request, **_kwargs):
+            opened.append(request.full_url)
+            return FakeHTTPResponse(json.dumps(next(responses)).encode("utf-8"))
+
+        client = runtime.SidecarClient(opener=opener)
+        with mock.patch.object(
+            client,
+            "configuration",
+            return_value={"url": "http://127.0.0.1:1234", "token": "test"},
+        ):
+            events = client.list_all_events("conversation-1", page_size=2)
+        self.assertEqual([event["stepIdx"] for event in events], [0, 1, 2])
+        self.assertIn("after=2", opened[1])
+
+    def test_event_sync_读取_sidecar_全部分页(self):
+        args = cli.build_parser().parse_args(["event", "sync"])
+        client = mock.Mock()
+        client.list_all_events.return_value = []
+        store = mock.Mock()
+        store.import_events.return_value = []
+        with (
+            mock.patch.object(cli, "SidecarClient", return_value=client),
+            mock.patch.object(cli, "EventStore", return_value=store),
+            mock.patch.object(cli, "TaskStore"),
+        ):
+            result, _ = self.capture(cli.event_command, args)
+        self.assertEqual(result["imported"], 0)
+        client.list_all_events.assert_called_once_with(None)
+
+    def test_conversation_wait_传递规范化时间下界(self):
+        args = cli.build_parser().parse_args(
+            [
+                "conversation",
+                "wait",
+                "--conversation-id",
+                "conversation-1",
+                "--backend",
+                "local",
+                "--after",
+                "2026-08-26T08:00:01+08:00",
+            ]
+        )
+        store = mock.Mock()
+        store.wait.return_value = {"kind": "Stop", "fullyIdle": True}
+        with mock.patch.object(cli, "EventStore", return_value=store):
+            cli.conversation_command(args)
+        store.wait.assert_called_once_with(
+            "conversation-1",
+            timeout_seconds=30,
+            after="2026-08-26T00:00:01Z",
+        )
 
     def test_companion_全局安装幂等且保留现有配置(self):
         home = Path(self.temporary_directory.name) / "home"

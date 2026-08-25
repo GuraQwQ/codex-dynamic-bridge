@@ -148,11 +148,14 @@ class EventStore:
             imported.append(normalized)
         return imported
 
-    def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.25):
+    def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.25, after=None):
         deadline = time.monotonic() + timeout_seconds
         while True:
-            event = self.latest(conversation_id, kind="Stop")
-            if event and event.get("fullyIdle") is True:
+            for event in reversed(self.list(conversation_id=conversation_id, limit=1000)):
+                if event.get("kind") != "Stop" or event.get("fullyIdle") is not True:
+                    continue
+                if after and event.get("observedAt", "") <= after:
+                    continue
                 return event
             if time.monotonic() >= deadline:
                 raise StateError(f"等待会话完成超时: {conversation_id}")

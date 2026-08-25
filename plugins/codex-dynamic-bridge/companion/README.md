@@ -31,7 +31,7 @@ python -m bridge.cli companion uninstall-global --confirm-uninstall
 Hook 命令需要指向 `event_sink.py` 和 Sidecar 运行数据目录中的 `endpoint.json` 绝对路径。
 不要把 `endpoint.json` 或其中的令牌提交到 Git。
 
-`PreToolUse` 只匹配 `run_command|ask_permission`，返回 Antigravity 官方 `ask` 决策。即使事件上报失败也不会返回 `allow`，因此不会绕过原有权限提示。事件仅保留 conversation ID、工具名、审批状态等白名单字段，不传输或保存完整命令参数。安装或更新 Hook 后需要重启一次 Antigravity；随后 Codex 可运行：
+`PreToolUse` 只匹配 `run_command|ask_permission`，返回 Antigravity 官方 `ask` 决策。即使事件上报失败也不会返回 `allow`，因此不会绕过原有权限提示。事件仅保留 conversation ID、工具名、审批状态等白名单字段，不传输或保存完整命令参数。事件查询支持 `limit` 与追加日志行号 `after` 游标，Bridge 的 `event sync` 会自动读取全部分页。安装或更新 Hook 后需要重启一次 Antigravity；随后 Codex 可运行：
 
 ```powershell
 python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_command

@@ -61,6 +61,37 @@ class SidecarTestCase(unittest.TestCase):
         _, result = self.request("GET", "/v1/events?conversation_id=conversation-1")
         self.assertEqual(len(result["events"]), 1)
 
+    def test_event_可按游标分页且不丢失(self):
+        for step_idx in range(5):
+            self.request(
+                "POST",
+                "/v1/events",
+                {
+                    "kind": "PostToolUse",
+                    "conversationId": "conversation-1",
+                    "stepIdx": step_idx,
+                },
+            )
+
+        _, latest = self.request("GET", "/v1/events?limit=2")
+        self.assertEqual([event["stepIdx"] for event in latest["events"]], [3, 4])
+
+        _, first = self.request("GET", "/v1/events?limit=2&after=0")
+        self.assertEqual([event["stepIdx"] for event in first["events"]], [0, 1])
+        self.assertTrue(first["hasMore"])
+
+        _, second = self.request(
+            "GET", f"/v1/events?limit=2&after={first['nextCursor']}"
+        )
+        self.assertEqual([event["stepIdx"] for event in second["events"]], [2, 3])
+        self.assertTrue(second["hasMore"])
+
+        _, last = self.request(
+            "GET", f"/v1/events?limit=2&after={second['nextCursor']}"
+        )
+        self.assertEqual([event["stepIdx"] for event in last["events"]], [4])
+        self.assertFalse(last["hasMore"])
+
     def test_pre_tool_use_只保留工具名和审批状态(self):
         event = event_sink.sanitize_event(
             "PreToolUse",

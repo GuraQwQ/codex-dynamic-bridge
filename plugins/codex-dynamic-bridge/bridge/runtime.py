@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -188,19 +189,48 @@ class SidecarClient:
             {"prompt": prompt},
         )
 
-    def list_events(self, conversation_id=None):
-        path = "/v1/events"
+    def event_page(self, conversation_id=None, limit=100, after=None):
+        if not 1 <= limit <= 1000 or (after is not None and after < 0):
+            raise RuntimeBridgeError("limit 必须为 1..1000，after 必须为非负整数")
+        query = {"limit": limit}
+        if after is not None:
+            query["after"] = after
         if conversation_id:
             if not all(character.isalnum() or character == "-" for character in conversation_id):
                 raise RuntimeBridgeError("conversation ID 只能包含字母、数字和连字符")
-            path += f"?conversation_id={conversation_id}"
-        return self.request("GET", path).get("events", [])
+            query["conversation_id"] = conversation_id
+        page = self.request("GET", f"/v1/events?{urlencode(query)}")
+        if (
+            not isinstance(page.get("events"), list)
+            or not isinstance(page.get("nextCursor"), int)
+            or not isinstance(page.get("hasMore"), bool)
+        ):
+            raise RuntimeBridgeError("Sidecar 事件分页响应无效")
+        return page
 
-    def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.5):
+    def list_events(self, conversation_id=None, limit=100):
+        return self.event_page(conversation_id, limit=limit)["events"]
+
+    def list_all_events(self, conversation_id=None, page_size=1000):
+        events = []
+        cursor = 0
+        while True:
+            page = self.event_page(conversation_id, limit=page_size, after=cursor)
+            events.extend(page["events"])
+            if not page.get("hasMore"):
+                return events
+            next_cursor = page.get("nextCursor")
+            if not isinstance(next_cursor, int) or next_cursor <= cursor:
+                raise RuntimeBridgeError("Sidecar 事件游标未向前推进")
+            cursor = next_cursor
+
+    def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.5, after=None):
         deadline = time.monotonic() + timeout_seconds
         while True:
             for event in reversed(self.list_events(conversation_id)):
                 if event.get("kind") == "Stop" and event.get("fullyIdle") is True:
+                    if after and event.get("observedAt", "") <= after:
+                        continue
                     return event
             if time.monotonic() >= deadline:
                 raise RuntimeBridgeError(f"等待 Sidecar 会话完成超时: {conversation_id}")

@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_BODY_BYTES = 1_048_576
 ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 EVENT_FIELDS = {
@@ -105,17 +105,25 @@ def append_event(payload):
     return event
 
 
-def list_events(conversation_id=None, limit=100):
+def list_events(conversation_id=None, limit=100, after=None):
     if not EVENTS_PATH.exists():
-        return []
+        return {"events": [], "nextCursor": after or 0, "hasMore": False}
     events = []
-    for line in EVENTS_PATH.read_text(encoding="utf-8").splitlines():
+    lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
+    for line_number, line in enumerate(lines, start=1):
+        if after is not None and line_number <= after:
+            continue
         if not line.strip():
             continue
         event = json.loads(line)
         if not conversation_id or event.get("conversationId") == conversation_id:
-            events.append(event)
-    return events[-limit:]
+            events.append((line_number, event))
+    page = events[-limit:] if after is None else events[:limit]
+    return {
+        "events": [event for _, event in page],
+        "nextCursor": page[-1][0] if page else len(lines),
+        "hasMore": after is not None and len(events) > limit,
+    }
 
 
 def load_schedules():
@@ -220,7 +228,16 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/events":
             query = parse_qs(parsed.query)
             conversation_id = query.get("conversation_id", [None])[0]
-            self.respond(200, {"events": list_events(conversation_id)})
+            try:
+                limit = int(query.get("limit", [100])[0])
+                raw_after = query.get("after", [None])[0]
+                after = int(raw_after) if raw_after is not None else None
+                if not 1 <= limit <= 1000 or (after is not None and after < 0):
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.respond(400, {"error": "limit 必须为 1..1000，after 必须为非负整数"})
+                return
+            self.respond(200, list_events(conversation_id, limit=limit, after=after))
             return
         if parsed.path == "/v1/schedules":
             with SCHEDULE_LOCK:
