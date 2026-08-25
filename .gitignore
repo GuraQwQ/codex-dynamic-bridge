@@ -13,3 +13,4 @@ events.jsonl
 endpoint.json
 schedules.json
 companion/**/data/
+.codegraph/
