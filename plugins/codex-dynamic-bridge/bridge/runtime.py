@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from bridge.state import after_event, completed_event
+
 
 class RuntimeBridgeError(RuntimeError):
     """外部 Antigravity 运行时不可用或返回无效结果。"""
@@ -189,19 +191,22 @@ class SidecarClient:
             {"prompt": prompt},
         )
 
-    def event_page(self, conversation_id=None, limit=100, after=None):
+    def event_page(self, conversation_id=None, limit=100, after=None, stream_id=None):
         if not 1 <= limit <= 1000 or (after is not None and after < 0):
             raise RuntimeBridgeError("limit 必须为 1..1000，after 必须为非负整数")
         query = {"limit": limit}
         if after is not None:
             query["after"] = after
+        if stream_id is not None:
+            query["stream_id"] = stream_id
         if conversation_id:
             if not all(character.isalnum() or character == "-" for character in conversation_id):
                 raise RuntimeBridgeError("conversation ID 只能包含字母、数字和连字符")
             query["conversation_id"] = conversation_id
         page = self.request("GET", f"/v1/events?{urlencode(query)}")
         if (
-            not isinstance(page.get("events"), list)
+            not isinstance(page, dict)
+            or not isinstance(page.get("events"), list)
             or not isinstance(page.get("nextCursor"), int)
             or not isinstance(page.get("hasMore"), bool)
         ):
@@ -227,11 +232,9 @@ class SidecarClient:
     def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.5, after=None):
         deadline = time.monotonic() + timeout_seconds
         while True:
-            for event in reversed(self.list_events(conversation_id)):
-                if event.get("kind") == "Stop" and event.get("fullyIdle") is True:
-                    if after and event.get("observedAt", "") <= after:
-                        continue
-                    return event
+            event = completed_event(self.list_events(conversation_id), after)
+            if event:
+                return event
             if time.monotonic() >= deadline:
                 raise RuntimeBridgeError(f"等待 Sidecar 会话完成超时: {conversation_id}")
             time.sleep(poll_seconds)
@@ -255,7 +258,7 @@ class SidecarClient:
                     continue
                 if approval_state and event.get("approvalState") != approval_state:
                     continue
-                if after and event.get("observedAt", "") <= after:
+                if not after_event(event, after):
                     continue
                 return event
             if time.monotonic() >= deadline:

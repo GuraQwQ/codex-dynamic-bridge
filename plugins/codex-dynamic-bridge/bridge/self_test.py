@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -218,6 +219,11 @@ class FakeProcessResult:
 class BridgeTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
+        environment = mock.patch.dict(os.environ, {
+            "CODEX_DYNAMIC_BRIDGE_DATA_DIR": self.temporary_directory.name,
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
         self.previous_links_path = cli.LINKS_PATH
         cli.LINKS_PATH = Path(self.temporary_directory.name) / "links.json"
 
@@ -1105,20 +1111,20 @@ class BridgeTestCase(unittest.TestCase):
         self.assertEqual([event["stepIdx"] for event in events], [0, 1, 2])
         self.assertIn("after=2", opened[1])
 
-    def test_event_sync_读取_sidecar_全部分页(self):
+    def test_event_sync_使用持久化增量同步(self):
         args = cli.build_parser().parse_args(["event", "sync"])
         client = mock.Mock()
-        client.list_all_events.return_value = []
         store = mock.Mock()
-        store.import_events.return_value = []
+        tasks = mock.Mock()
         with (
             mock.patch.object(cli, "SidecarClient", return_value=client),
             mock.patch.object(cli, "EventStore", return_value=store),
-            mock.patch.object(cli, "TaskStore"),
+            mock.patch.object(cli, "TaskStore", return_value=tasks),
+            mock.patch.object(cli, "sync_events", return_value={"imported": 0}) as sync,
         ):
             result, _ = self.capture(cli.event_command, args)
         self.assertEqual(result["imported"], 0)
-        client.list_all_events.assert_called_once_with(None)
+        sync.assert_called_once_with(client, store, tasks, None)
 
     def test_conversation_wait_传递规范化时间下界(self):
         args = cli.build_parser().parse_args(

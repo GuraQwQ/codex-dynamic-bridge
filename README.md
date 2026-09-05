@@ -99,6 +99,21 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - 结构化 headless 会话可选使用官方 `agy` CLI。
 - 事件、等待和计划任务可选使用仓库内的 Antigravity Companion Sidecar。
 
+### 跨模型监工
+
+GPT-5.6 Sol 与 GPT-6 Astra 共用现有 CLI/CDP 基础能力，不需要原生电脑控制即可使用插件。宿主确实提供电脑控制或异步工具时，可用来增强视觉验收和等待体验；插件不会根据模型名称假定工具已开放。
+
+发送前生成持久化投递回执，`conversation wait` / `event wait` 默认使用最新回执的时间下界。`event sync` 按端点和会话过滤范围逐页保存进度，重复调用只读增量；新版 Companion 会报告 `eventStreamCursor: true`。原有事件与计划任务无需改写，首次同步会重读并去重。
+
+```powershell
+python -m bridge.cli event sync
+python -m bridge.cli task inspect --conversation-id <id>
+python -m bridge.cli task submissions
+python -m bridge.cli task record-review --submission-id <id> --verdict passed --evidence <absolute-report-path> --confirm-review
+```
+
+投递已接受、观察到停止、验收通过是三个独立状态。测试与评审由监工使用宿主工具执行，插件只保存回执与证据摘要；不确定结果不自动重发。周期监工优先用宿主计划任务，保留现有 Sidecar 调度但不新增调度服务。完整流程见 [监工生命周期](plugins/codex-dynamic-bridge/skills/codex-dynamic-bridge/references/supervision.md)。
+
 ### 能力层级
 
 首先运行：
@@ -438,7 +453,7 @@ Antigravity 的 DOM 可能变化。先用 `control inspect` 和只读命令重�
 ```powershell
 git clone https://github.com/GuraQwQ/codex-dynamic-bridge.git
 Set-Location .\codex-dynamic-bridge\plugins\codex-dynamic-bridge
-python -m bridge.self_test
+python -m unittest bridge.self_test bridge.supervision_test
 ```
 
 项目结构：
@@ -468,7 +483,7 @@ python -m bridge.self_test
 ```powershell
 Set-Location .\plugins\codex-dynamic-bridge
 python -m compileall -q bridge
-python -m bridge.self_test
+python -m unittest bridge.self_test bridge.supervision_test
 Set-Location .\companion\antigravity-plugin\sidecars\codex-bridge
 python .\self_test.py
 ```
@@ -567,6 +582,12 @@ python -c "import sys, playwright; print(sys.executable); print('Playwright OK')
 - `control` commands require Python Playwright, but no separate Chromium installation.
 - Structured headless conversations may optionally use the official `agy` CLI.
 - Events, completion waits, and schedules may optionally use the included Antigravity Companion Sidecar.
+
+### Cross-model supervision
+
+GPT-5.6 Sol and GPT-6 Astra share the same CLI/CDP foundation. Native computer control and asynchronous tools are optional host capabilities, not model-name prerequisites. Dispatch receipts are persisted before sending; waits use the latest receipt boundary by default. Incremental event sync checkpoints each page and replays interrupted pages without rewriting the original Sidecar log or existing schedules.
+
+Use `task inspect` to distinguish delivery, observed execution, and review. `task record-review` binds an explicit verdict to a submission and an evidence-file digest; it does not execute tests or prove unchanged source code. Prefer the host's existing scheduler for recurring supervision. See the [supervision lifecycle](plugins/codex-dynamic-bridge/skills/codex-dynamic-bridge/references/supervision.md).
 
 ### Capability tiers
 
@@ -907,7 +928,7 @@ Antigravity's DOM may change. Re-observe the page with `control inspect` and rea
 ```powershell
 git clone https://github.com/GuraQwQ/codex-dynamic-bridge.git
 Set-Location .\codex-dynamic-bridge\plugins\codex-dynamic-bridge
-python -m bridge.self_test
+python -m unittest bridge.self_test bridge.supervision_test
 ```
 
 Repository layout:
@@ -937,7 +958,7 @@ Run checks:
 ```powershell
 Set-Location .\plugins\codex-dynamic-bridge
 python -m compileall -q bridge
-python -m bridge.self_test
+python -m unittest bridge.self_test bridge.supervision_test
 Set-Location .\companion\antigravity-plugin\sidecars\codex-bridge
 python .\self_test.py
 ```

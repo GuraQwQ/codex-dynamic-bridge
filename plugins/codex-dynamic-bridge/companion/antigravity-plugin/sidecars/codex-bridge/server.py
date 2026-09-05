@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -6,13 +7,14 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 MAX_BODY_BYTES = 1_048_576
 ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 EVENT_FIELDS = {
@@ -34,7 +36,7 @@ EVENT_FIELDS = {
 
 
 def utc_now():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def data_dir():
@@ -105,25 +107,41 @@ def append_event(payload):
     return event
 
 
-def list_events(conversation_id=None, limit=100, after=None):
-    if not EVENTS_PATH.exists():
-        return {"events": [], "nextCursor": after or 0, "hasMore": False}
-    events = []
-    lines = EVENTS_PATH.read_text(encoding="utf-8").splitlines()
-    for line_number, line in enumerate(lines, start=1):
-        if after is not None and line_number <= after:
-            continue
-        if not line.strip():
-            continue
-        event = json.loads(line)
-        if not conversation_id or event.get("conversationId") == conversation_id:
-            events.append((line_number, event))
-    page = events[-limit:] if after is None else events[:limit]
-    return {
-        "events": [event for _, event in page],
-        "nextCursor": page[-1][0] if page else len(lines),
-        "hasMore": after is not None and len(events) > limit,
-    }
+def list_events(conversation_id=None, limit=100, after=None, stream_id=None):
+    try:
+        stream = EVENTS_PATH.open("r", encoding="utf-8")
+    except FileNotFoundError:
+        return {"events": [], "nextCursor": 0, "hasMore": False,
+                "streamId": "empty", "reset": bool(after or stream_id not in (None, "empty"))}
+    with stream:
+        stat = os.fstat(stream.fileno())
+        identity = f"{stat.st_dev}:{stat.st_ino}:{getattr(stat, 'st_birthtime_ns', 0)}"
+        current_id = hashlib.sha256(identity.encode("ascii")).hexdigest()
+        reset = stream_id is not None and stream_id != current_id
+        start = 0 if reset else (after or 0)
+        while True:
+            events = deque(maxlen=limit)
+            cursor = 0
+            has_more = False
+            for line_number, line in enumerate(stream, start=1):
+                # 正在追加的尾行尚未提交，留给下一次查询。
+                if not line.endswith("\n"):
+                    break
+                if line_number > start and line.strip():
+                    event = json.loads(line)
+                    if not conversation_id or event.get("conversationId") == conversation_id:
+                        if after is not None and len(events) == limit:
+                            has_more = True
+                            break
+                        events.append(event)
+                cursor = line_number
+            if cursor < start:
+                start = 0
+                reset = True
+                stream.seek(0)
+                continue
+            return {"events": list(events), "nextCursor": cursor, "hasMore": has_more,
+                    "streamId": current_id, "reset": reset}
 
 
 def load_schedules():
@@ -223,7 +241,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         if parsed.path == "/v1/health":
-            self.respond(200, {"status": "ok", "version": VERSION})
+            self.respond(200, {"status": "ok", "version": VERSION,
+                               "capabilities": {"eventStreamCursor": True}})
             return
         if parsed.path == "/v1/events":
             query = parse_qs(parsed.query)
@@ -237,7 +256,10 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self.respond(400, {"error": "limit 必须为 1..1000，after 必须为非负整数"})
                 return
-            self.respond(200, list_events(conversation_id, limit=limit, after=after))
+            self.respond(200, list_events(
+                conversation_id, limit=limit, after=after,
+                stream_id=query.get("stream_id", [None])[0],
+            ))
             return
         if parsed.path == "/v1/schedules":
             with SCHEDULE_LOCK:

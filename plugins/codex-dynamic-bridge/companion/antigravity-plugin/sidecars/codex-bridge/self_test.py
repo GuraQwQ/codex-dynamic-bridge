@@ -107,6 +107,33 @@ class SidecarTestCase(unittest.TestCase):
         self.assertEqual(event["approvalState"], "requested")
         self.assertNotIn("toolCall", event)
 
+    def test_event_空状态及日志替换后恢复游标(self):
+        _, empty = self.request("GET", "/v1/events?after=0")
+        self.assertEqual(empty["nextCursor"], 0)
+        self.request("POST", "/v1/events", {"conversationId": "c1", "kind": "Stop"})
+        _, first = self.request("GET", "/v1/events?after=0")
+        old_stream = first["streamId"]
+        server.EVENTS_PATH.rename(server.EVENTS_PATH.with_suffix(".old"))
+        self.request("POST", "/v1/events", {"conversationId": "c2", "kind": "Stop"})
+        _, reset = self.request(
+            "GET", f"/v1/events?after={first['nextCursor']}&stream_id={old_stream}"
+        )
+        self.assertTrue(reset["reset"])
+        self.assertEqual(reset["events"][0]["conversationId"], "c2")
+        self.assertNotEqual(reset["streamId"], old_stream)
+
+    def test_event_过滤空页推进游标且截断后重读(self):
+        for index in range(3):
+            self.request("POST", "/v1/events", {"conversationId": "other", "stepIdx": index})
+        _, page = self.request("GET", "/v1/events?after=0&conversation_id=c1")
+        self.assertEqual(page["events"], [])
+        self.assertEqual(page["nextCursor"], 3)
+        server.EVENTS_PATH.write_text("", encoding="utf-8")
+        self.request("POST", "/v1/events", {"conversationId": "c1", "kind": "Stop"})
+        _, reset = self.request("GET", f"/v1/events?after=3&stream_id={page['streamId']}")
+        self.assertTrue(reset["reset"])
+        self.assertEqual(len(reset["events"]), 1)
+
     def test_schedule_创建列出删除(self):
         status, schedule = self.request(
             "POST",

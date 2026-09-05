@@ -5,6 +5,15 @@ description: 发现、读取、创建和管理 Antigravity 会话、模型、项
 
 # Codex Dynamic Bridge
 
+## 模型与宿主适配
+
+本插件不限定 Codex 使用的模型。GPT-5.6 Sol、GPT-6 Astra 及其它具备工具调用能力的模型共用相同 CLI、回执和事件协议；`--model` 指的是 Antigravity 执行模型，不是 Codex 监工模型。
+
+- 基础路径使用本插件的 CLI、CDP 和可选 Sidecar，不要求原生电脑控制或异步工具。
+- 当前宿主确实提供并允许电脑控制时，可以用它检查视觉结果或处理 CLI 未覆盖的界面。优先保留能返回会话 ID 和投递回执的结构化发送；不要仅凭模型名称假定工具可用。
+- GPT-6 Astra 可更充分利用视觉判断和宿主开放的异步等待，但不会自动获得后台执行、事件订阅或审批权限。Sol 不应因缺少这些可选能力而退出任务。
+- 要安排周期监工时，优先使用宿主现有计划任务工具；用户明确需要独立于宿主运行的 Antigravity 周期任务时仍可使用 `schedule`。创建前检查已有任务，区分执行与监工职责并避免重复排程；不要在插件之外另建轮询进程或调度服务。
+
 从本文件所在目录向上两级得到插件根目录。所有命令都在插件根目录运行：
 
 ```powershell
@@ -98,6 +107,8 @@ python -m bridge.cli artifact list --conversation-id <id>
 
 监工默认是只读审查。除非用户明确要求 Codex 直接修改目标仓库，否则不要代替 Antigravity 改文件。
 
+持续监工、恢复中断任务或记录验收结论时，读取 [监工生命周期](references/supervision.md)。该文档说明如何分别核对投递、执行和验收状态，以及在 Sol 的同步路径和宿主异步路径下继续工作。
+
 ## 会话、模型和项目
 
 结构化新建、继续或恢复会话：
@@ -106,8 +117,10 @@ python -m bridge.cli artifact list --conversation-id <id>
 python -m bridge.cli conversation new --prompt-stdin --project-id <project> --model <slug> --effort high --confirm-create
 python -m bridge.cli conversation send --conversation-id <id> --prompt-stdin --confirm-send
 python -m bridge.cli conversation resume --conversation-id <id> --prompt-stdin --confirm-send
-python -m bridge.cli conversation wait --conversation-id <id> --after <发送前记录的 ISO 8601 时间>
+python -m bridge.cli conversation wait --conversation-id <id> --timeout-seconds 30
 ```
+
+`new/send/resume/open-new/send-now` 会在发送前持久化回执，成功后返回 `submission.submissionId`。`conversation wait` 与 `event wait` 默认使用该会话最新回执的时间下界；未通过插件投递的任务仍可显式传入 `--after <ISO-8601>`。等待完成仅表示观察到空闲 Stop，不代表验收通过。
 
 用户已有项目目录时，使用 `agy` 的工作目录和新项目开关，不能只把本地路径当作 `project-id`：
 
@@ -166,9 +179,11 @@ python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_
 python -m bridge.cli approval inspect --id <id>
 python -m bridge.cli task link --conversation-id <id> --codex-task-id <id> --project-id <id>
 python -m bridge.cli task list
+python -m bridge.cli task submissions --conversation-id <id>
+python -m bridge.cli task inspect --conversation-id <id>
 ```
 
-`event sync` 会使用追加日志行号游标读取全部分页，不再只导入最新 100 条。事件与任务状态只保存白名单字段；不要把会话正文、Hook 原始 payload、令牌或凭据写入链接和任务账本。
+`event sync` 按 Sidecar 端点文件和会话过滤范围保存进度，逐页提交；重复执行只读取增量，日志替换或截短后重读并去重。此能力需要 `doctor.sidecar.eventStreamCursor: true`；更新 Companion 前仍可使用 CLI/CDP 基础路径。`task inspect` 只读本地快照，需要新事件时先同步。事件与任务状态只保存白名单字段；不要把会话正文、Hook 原始 payload、令牌或凭据写入链接和任务账本。
 
 投递长任务后主动等待 `PreToolUse` 审批事件，不依赖偶尔读取整页。事件到达后先运行 `approval inspect`，它可返回当前可见命令、选项与提交按钮，但不会持久化命令正文。用户明确授权当前命令，或明确授权监工在限定任务范围内自主判断并审批后，才能把事件返回的 `toolName`、`observedAt` 与检查到的精确选项/按钮绑定后响应：
 
@@ -177,6 +192,8 @@ python -m bridge.cli approval respond --id <id> --decision allow --option-name <
 ```
 
 未授权时只通知用户。`PreToolUse` Hook 返回 `ask`，绝不返回 `allow` 绕过权限；只保存工具名和审批状态，不保存完整命令参数。
+
+Companion 不可用时，可继续用 CDP 读取页面、Review diff 和 `approval inspect` 检查当前审批框，但不能等待不存在的 Hook 来源；`approval respond` 的事件绑定依赖 Companion，对 Sol 和 Astra 相同。此时报告待审批状态及能力缺口，不声称已完成自主审批，也不伪造事件或自动安装组件。
 
 ## 低层语义控制
 
@@ -201,4 +218,4 @@ python -m bridge.cli control select-role --id <id> --role combobox --name <name>
 - 缺少 Playwright、`agy` 或 Sidecar 时报告能力缺口；只有用户明确要求插件完成任务并授权完整装载时，才可运行 `setup ensure --confirm-setup`。
 - 全局 Companion 安装和卸载分别需要 `--confirm-install` 与 `--confirm-uninstall`；不得仅凭 Sidecar 缺失就自动修改 Antigravity 配置。
 - 正在运行的会话收到补充信息时使用 `conversation send --backend auto` 或 `conversation send-now`；不要使用默认 Sidecar `conversation send` 让补充留在 `Queued Messages` 等待会话结束。
-- 自动批准只适用于用户明确授权的当前可见命令；设置了 Companion 或 `--confirm-approval` 本身不构成批准任意命令的授权。
+- 自动批准只适用于用户明确授权的当前命令，或已授权监工任务范围内核对过的命令；设置了 Companion 或 `--confirm-approval` 本身不构成批准任意命令的授权。

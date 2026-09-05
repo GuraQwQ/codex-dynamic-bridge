@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +31,10 @@ TASK_FIELDS = {
     "status",
     "artifactDirectoryPath",
     "updatedAt",
+    "workspacePaths",
+    "lastObservedAt",
+    "submissionId",
+    "lastSubmittedAt",
 }
 
 
@@ -38,7 +43,57 @@ class StateError(RuntimeError):
 
 
 def utc_now():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def event_time(value):
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise StateError("事件时间必须包含时区")
+    return parsed
+
+
+def after_event(event, after):
+    return not after or event_time(event["observedAt"]) > event_time(after)
+
+
+def completed_event(events, after=None):
+    latest = max(
+        (event for event in reversed(events) if after_event(event, after)),
+        key=lambda event: event_time(event["observedAt"]), default=None,
+    )
+    if latest and latest.get("kind") == "Stop" and latest.get("fullyIdle") is True:
+        return latest
+    return None
+
+
+@contextmanager
+def file_lock(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 锁定独立 inode，目标文件可在短事务中原子替换；进程退出时操作系统释放锁。
+    with path.with_name(path.name + ".lock").open("a+b") as stream:
+        if os.name == "nt":
+            import msvcrt
+
+            if stream.tell() == 0:
+                stream.write(b"0")
+                stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 def default_data_dir(env=None):
@@ -95,11 +150,7 @@ class EventStore:
             event.setdefault("status", "waiting_approval")
         if not event.get("conversationId"):
             raise StateError("Hook 输入缺少 conversationId")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
+        self.import_events([event])
         return event
 
     def list(self, conversation_id=None, limit=100):
@@ -116,7 +167,8 @@ class EventStore:
                     raise StateError(f"事件文件第 {line_number} 行不是有效 JSON") from exc
                 if not conversation_id or event.get("conversationId") == conversation_id:
                     events.append(event)
-        return events[-limit:]
+        events.sort(key=lambda event: event_time(event["observedAt"]))
+        return events if limit is None else (events[-limit:] if limit else [])
 
     def latest(self, conversation_id, kind=None):
         events = self.list(conversation_id=conversation_id, limit=1000)
@@ -125,9 +177,14 @@ class EventStore:
         return events[-1] if events else None
 
     def import_events(self, events):
+        with file_lock(self.path):
+            return self._import_events(events)
+
+    def _import_events(self, events):
+        records = self.list(limit=None)
         existing = {
             json.dumps(event, ensure_ascii=False, sort_keys=True)
-            for event in self.list(limit=1_000_000)
+            for event in records
         }
         imported = []
         for event in events:
@@ -141,21 +198,31 @@ class EventStore:
             serialized = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
             if serialized in existing or not normalized.get("conversationId"):
                 continue
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(normalized, ensure_ascii=False) + "\n")
             existing.add(serialized)
             imported.append(normalized)
+        if imported:
+            temporary_path = None
+            try:
+                # ponytail: 每页重写本地日志以保证中断原子性；日志显著增长后再迁移 SQLite。
+                with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", dir=self.path.parent, delete=False
+                ) as stream:
+                    temporary_path = Path(stream.name)
+                    for event in records + imported:
+                        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_path, self.path)
+            finally:
+                if temporary_path and temporary_path.exists():
+                    temporary_path.unlink()
         return imported
 
     def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.25, after=None):
         deadline = time.monotonic() + timeout_seconds
         while True:
-            for event in reversed(self.list(conversation_id=conversation_id, limit=1000)):
-                if event.get("kind") != "Stop" or event.get("fullyIdle") is not True:
-                    continue
-                if after and event.get("observedAt", "") <= after:
-                    continue
+            event = completed_event(self.list(conversation_id=conversation_id, limit=1000), after)
+            if event:
                 return event
             if time.monotonic() >= deadline:
                 raise StateError(f"等待会话完成超时: {conversation_id}")
@@ -179,7 +246,7 @@ class EventStore:
                     continue
                 if tool_name and event.get("toolName") != tool_name:
                     continue
-                if after and event.get("observedAt", "") <= after:
+                if not after_event(event, after):
                     continue
                 return event
             if time.monotonic() >= deadline:
@@ -205,7 +272,7 @@ class EventStore:
         )
         return {
             "conversationId": conversation_id,
-            "status": "idle" if stop and stop.get("fullyIdle") else "running",
+            "status": "idle" if completed_event(events) else "running",
             "eventCount": len(events),
             "model": latest.get("modelName"),
             "projectId": latest.get("projectId"),
@@ -237,6 +304,18 @@ class TaskStore:
         return value
 
     def upsert(self, record):
+        return self.upsert_many([record])[0]
+
+    def upsert_many(self, records):
+        with file_lock(self.path):
+            tasks = {task["conversationId"]: task for task in self.load()}
+            updated = [self._merge(tasks, record) for record in records]
+            if updated:
+                ordered = sorted(tasks.values(), key=lambda task: task.get("updatedAt", ""), reverse=True)
+                atomic_write_json(self.path, ordered)
+            return updated
+
+    def _merge(self, tasks, record):
         if not isinstance(record, dict) or not record.get("conversationId"):
             raise StateError("任务映射必须包含 conversationId")
         normalized = {
@@ -245,21 +324,26 @@ class TaskStore:
             if key in record and record[key] not in (None, "")
         }
         normalized["updatedAt"] = utc_now()
-        tasks = self.load()
-        old = next(
-            (item for item in tasks if item.get("conversationId") == normalized["conversationId"]),
-            {},
-        )
+        old = tasks.get(normalized["conversationId"], {})
+        if normalized.get("lastSubmittedAt") and old.get("lastSubmittedAt"):
+            if event_time(normalized["lastSubmittedAt"]) < event_time(old["lastSubmittedAt"]):
+                return old
+        if normalized.get("lastObservedAt"):
+            previous = [old[key] for key in ("lastObservedAt", "lastSubmittedAt") if old.get(key)]
+            if previous and event_time(normalized["lastObservedAt"]) < max(map(event_time, previous)):
+                return old
+        if normalized.get("lastSubmittedAt") and old.get("lastObservedAt"):
+            if event_time(old["lastObservedAt"]) >= event_time(normalized["lastSubmittedAt"]):
+                normalized.pop("status", None)
         merged = {**old, **normalized}
-        tasks = [
-            item for item in tasks if item.get("conversationId") != normalized["conversationId"]
-        ]
-        tasks.append(merged)
-        tasks.sort(key=lambda item: item.get("updatedAt", ""), reverse=True)
-        atomic_write_json(self.path, tasks)
+        tasks[normalized["conversationId"]] = merged
         return merged
 
     def remove(self, conversation_id):
+        with file_lock(self.path):
+            return self._remove(conversation_id)
+
+    def _remove(self, conversation_id):
         tasks = self.load()
         remaining = [item for item in tasks if item.get("conversationId") != conversation_id]
         if len(remaining) == len(tasks):
@@ -268,14 +352,19 @@ class TaskStore:
         return {"removed": conversation_id, "total": len(remaining)}
 
     def sync_event(self, event):
-        record = {
+        return self.sync_events([event])[0]
+
+    def sync_events(self, events):
+        records = [{
             "conversationId": event["conversationId"],
             "model": event.get("modelName"),
             "status": "idle" if event.get("fullyIdle") else event.get("status", "running"),
             "artifactDirectoryPath": event.get("artifactDirectoryPath"),
             "projectId": event.get("projectId"),
-        }
-        return self.upsert(record)
+            "workspacePaths": event.get("workspacePaths"),
+            "lastObservedAt": event.get("observedAt"),
+        } for event in sorted(events, key=lambda item: event_time(item["observedAt"]))]
+        return self.upsert_many(records)
 
 
 def artifact_root_for_conversation(event_store, conversation_id):

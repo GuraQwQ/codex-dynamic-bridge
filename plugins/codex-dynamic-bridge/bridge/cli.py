@@ -32,6 +32,7 @@ from bridge.state import (
     list_artifacts,
     read_artifact,
 )
+from bridge.supervision import SubmissionStore, sync_events
 
 
 REQUIRED_FIELDS = ("id", "title", "url", "source", "updatedAt")
@@ -445,6 +446,9 @@ def doctor_command(_):
         try:
             result["sidecar"]["health"] = SidecarClient().health()
             result["sidecar"]["available"] = True
+            result["sidecar"]["eventStreamCursor"] = bool(
+                result["sidecar"]["health"].get("capabilities", {}).get("eventStreamCursor")
+            )
         except RuntimeBridgeError as exc:
             result["sidecar"]["available"] = False
             result["sidecar"]["error"] = str(exc)
@@ -494,7 +498,11 @@ def conversation_command(args):
     event_store = EventStore()
     task_store = TaskStore()
     if args.conversation_action == "wait":
-        after = format_timestamp(parse_timestamp(args.after)) if args.after else None
+        receipt = SubmissionStore().latest(args.conversation_id)
+        after = (
+            format_timestamp(parse_timestamp(args.after)) if args.after
+            else receipt["submittedAt"] if receipt else None
+        )
         if args.backend in {"auto", "sidecar"}:
             try:
                 sidecar = SidecarClient()
@@ -519,6 +527,8 @@ def conversation_command(args):
 
     if args.conversation_action in {"send", "resume"} and not args.confirm_send:
         raise BridgeError("发送消息会修改会话；请在明确授权后传入 --confirm-send")
+    if args.conversation_action == "new" and not args.confirm_create:
+        raise BridgeError("新建会话会修改 Antigravity；请在明确授权后传入 --confirm-create")
     prompt = prompt_from_args(args)
     if args.conversation_action in {"send", "resume"} and args.backend == "auto":
         try:
@@ -549,49 +559,37 @@ def conversation_command(args):
     ):
         backend_name = "agy"
     backend, client = select_runtime_backend(backend_name, require_agy=require_agy)
-    if args.conversation_action == "new":
-        if not args.confirm_create:
-            raise BridgeError("新建会话会修改 Antigravity；请在明确授权后传入 --confirm-create")
-        if backend == "sidecar":
-            result = client.new_conversation(prompt)
-        else:
-            result = client.run_prompt(
-                prompt,
-                project_id=args.project_id,
-                model=args.model,
-                effort=args.effort,
-                agent=args.agent,
-                timeout_seconds=args.timeout_seconds,
-                project_path=getattr(args, "project_path", None),
-                new_project=getattr(args, "new_project", False),
-            )
-    else:
-        if backend == "sidecar":
-            result = client.send_message(args.conversation_id, prompt)
-        else:
-            result = client.run_prompt(
-                prompt,
-                conversation_id=args.conversation_id,
-                model=args.model,
-                effort=args.effort,
-                agent=args.agent,
-                timeout_seconds=args.timeout_seconds,
-                project_path=getattr(args, "project_path", None),
-            )
+    conversation_id = getattr(args, "conversation_id", None)
 
-    conversation_id = result.get("conversation_id") or result.get("conversationId")
+    def invoke():
+        if backend == "sidecar":
+            return (client.new_conversation(prompt) if args.conversation_action == "new"
+                    else client.send_message(conversation_id, prompt))
+        return client.run_prompt(
+            prompt, conversation_id=conversation_id,
+            project_id=getattr(args, "project_id", None),
+            model=args.model, effort=args.effort, agent=args.agent,
+            timeout_seconds=args.timeout_seconds,
+            project_path=getattr(args, "project_path", None),
+            new_project=getattr(args, "new_project", False),
+        )
+
+    result, receipt = SubmissionStore().dispatch(
+        args.conversation_action, backend, conversation_id, invoke, task_store
+    )
+    conversation_id = receipt["conversationId"]
     if conversation_id:
         task = task_store.upsert(
             {
                 "conversationId": conversation_id,
                 "projectId": getattr(args, "project_id", None),
                 "model": args.model,
-                "status": result.get("status", "submitted").lower(),
+                "lastSubmittedAt": receipt["submittedAt"],
             }
         )
     else:
         task = None
-    return print_json({"backend": backend, "result": result, "task": task})
+    return print_json({"backend": backend, "result": result, "task": task, "submission": receipt})
 
 
 def model_command(args):
@@ -604,11 +602,7 @@ def event_command(args):
     store = EventStore()
     tasks = TaskStore()
     if args.event_action == "sync":
-        imported = store.import_events(
-            SidecarClient().list_all_events(args.conversation_id)
-        )
-        synced_tasks = [tasks.sync_event(event) for event in imported]
-        return print_json({"imported": len(imported), "tasks": synced_tasks})
+        return print_json(sync_events(SidecarClient(), store, tasks, args.conversation_id))
     if args.event_action == "ingest":
         try:
             payload = json.load(sys.stdin)
@@ -647,7 +641,9 @@ def event_command(args):
                 after=after,
             )
         )
-    after = format_timestamp(parse_timestamp(args.after)) if args.after else None
+    receipt = SubmissionStore().latest(args.conversation_id)
+    after = (format_timestamp(parse_timestamp(args.after)) if args.after
+             else receipt["submittedAt"] if receipt else None)
     return print_json(
         store.wait(
             args.conversation_id,
@@ -742,6 +738,16 @@ def setup_command(args):
 
 def task_command(args):
     store = TaskStore()
+    if args.task_action == "inspect":
+        return print_json(SubmissionStore().inspect(
+            EventStore(), conversation_id=args.conversation_id, submission_id=args.submission_id
+        ))
+    if args.task_action == "submissions":
+        return print_json(SubmissionStore().list(args.conversation_id))
+    if args.task_action == "record-review":
+        if not args.confirm_review:
+            raise BridgeError("记录验收结论需明确授权；请传入 --confirm-review")
+        return print_json(SubmissionStore().record_review(args.submission_id, args.verdict, args.evidence))
     if args.task_action == "list":
         return print_json(store.load())
     if args.task_action == "remove":
@@ -755,6 +761,9 @@ def task_command(args):
         "model": args.model,
         "status": args.status,
     }
+    if getattr(args, "submission_id", None):
+        receipt = SubmissionStore().bind(args.submission_id, args.conversation_id)
+        record.update({"submissionId": receipt["submissionId"], "lastSubmittedAt": receipt["submittedAt"]})
     return print_json(store.upsert(record))
 
 
@@ -780,12 +789,19 @@ def run_desktop_workflow(args, workflow_action, allow_shell=False):
         else select_sessions(discover_sessions(), args.id)[0]
     )
     try:
-        result = execute_control(
-            read_antigravity_port(),
-            session["conversationId"],
-            args,
-            **({"page_url": page["url"]} if page else {}),
-        )
+        port = read_antigravity_port()
+
+        def invoke():
+            return execute_control(port, session["conversationId"], args,
+                                   **({"page_url": page["url"]} if page else {}))
+
+        if workflow_action == "conversation-send-now":
+            result, receipt = SubmissionStore().dispatch(
+                "send-now", "desktop", session["conversationId"], invoke, TaskStore()
+            )
+            result["submission"] = receipt
+        else:
+            result = invoke()
     except ControlError as exc:
         raise BridgeError(str(exc)) from exc
     result["conversationId"] = session["conversationId"]
@@ -803,11 +819,11 @@ def run_new_conversation_workflow(args):
     args.prompt = prompt_from_args(args)
     page = select_app_page(discover_app_pages(), args.id)
     try:
-        result = execute_control(
-            read_antigravity_port(),
-            page.get("conversationId"),
-            args,
-            page_url=page["url"],
+        port = read_antigravity_port()
+        result, receipt = SubmissionStore().dispatch(
+            "open-new", "desktop", None,
+            lambda: execute_control(port, page.get("conversationId"), args, page_url=page["url"]),
+            TaskStore(),
         )
     except ControlError as exc:
         raise BridgeError(str(exc)) from exc
@@ -815,6 +831,7 @@ def run_new_conversation_workflow(args):
     if not conversation_id:
         raise BridgeError("新建会话动作完成，但未观察到新的 conversation ID；不要自动重试")
     result["conversationId"] = conversation_id
+    result["submission"] = receipt
     result["sourceDevtoolsId"] = page["devtoolsId"]
     result["bootstrappedFromShell"] = page["kind"] == "shell"
     return print_json(result)
@@ -1181,8 +1198,23 @@ def build_parser():
     task_subparsers = task_parser.add_subparsers(dest="task_action", required=True)
     task_list_parser = task_subparsers.add_parser("list", help="列出任务映射")
     task_list_parser.set_defaults(func=task_command)
+    task_inspect_parser = task_subparsers.add_parser("inspect", help="只读检查投递、执行和验收状态")
+    task_target = task_inspect_parser.add_mutually_exclusive_group(required=True)
+    task_target.add_argument("--conversation-id")
+    task_target.add_argument("--submission-id")
+    task_inspect_parser.set_defaults(func=task_command)
+    submissions_parser = task_subparsers.add_parser("submissions", help="列出投递回执以恢复中断任务")
+    submissions_parser.add_argument("--conversation-id")
+    submissions_parser.set_defaults(func=task_command)
+    review_parser = task_subparsers.add_parser("record-review", help="绑定本次投递的验收结论与证据文件")
+    review_parser.add_argument("--submission-id", required=True)
+    review_parser.add_argument("--verdict", required=True, choices=("passed", "failed"))
+    review_parser.add_argument("--evidence", required=True, type=Path)
+    review_parser.add_argument("--confirm-review", action="store_true")
+    review_parser.set_defaults(func=task_command)
     task_link_parser = task_subparsers.add_parser("link", help="添加或更新任务映射")
     task_link_parser.add_argument("--conversation-id", required=True)
+    task_link_parser.add_argument("--submission-id", help="核对真实会话后补全中断投递的归属，不会重发")
     task_link_parser.add_argument("--codex-task-id")
     task_link_parser.add_argument("--project-id")
     task_link_parser.add_argument("--title")
