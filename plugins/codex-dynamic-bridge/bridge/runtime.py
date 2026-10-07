@@ -1,8 +1,12 @@
+import codecs
 import json
 import os
+import queue
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -42,15 +46,16 @@ def find_agy(env=None):
 
 
 class AgyClient:
-    def __init__(self, executable=None, runner=None):
+    def __init__(self, executable=None, runner=None, popen=None):
         self.executable = executable or find_agy()
         self.runner = runner or subprocess.run
+        self.popen = popen or subprocess.Popen
         if not self.executable:
             raise RuntimeBridgeError(
                 "未找到 Antigravity CLI；设置 CODEX_DYNAMIC_BRIDGE_AGY 或安装 agy"
             )
 
-    def invoke(self, arguments, timeout_seconds=300, cwd=None):
+    def invoke(self, arguments, timeout_seconds=300, cwd=None, return_process=False):
         command = [self.executable, *arguments]
         try:
             result = self.runner(
@@ -70,7 +75,31 @@ class AgyClient:
             raise RuntimeBridgeError(
                 f"Antigravity CLI 退出码 {result.returncode}: {detail[:1000]}"
             )
-        return result.stdout
+        return result if return_process else result.stdout
+
+    def capabilities(self):
+        flags = dict.fromkeys(
+            ("project", "conversation", "new-project", "model", "effort", "agent",
+             "stream-json", "json-schema"),
+            False,
+        )
+        result = {"available": False, "path": self.executable, "version": None, "flags": flags}
+        try:
+            version_process = self.invoke(["--version"], timeout_seconds=10, return_process=True)
+            raw_version = (version_process.stdout or "") + "\n" + (version_process.stderr or "")
+            match = re.search(r"\b(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)\b", raw_version)
+            if not match:
+                raise RuntimeBridgeError("Antigravity CLI 未返回可识别版本")
+            result["version"] = match.group(1)
+            help_process = self.invoke(["--help"], timeout_seconds=10, return_process=True)
+            help_text = (help_process.stdout or "") + "\n" + (help_process.stderr or "")
+            for flag in flags:
+                pattern = r"\bstream-json\b" if flag == "stream-json" else rf"(?<![\w-])--{flag}(?![\w-])"
+                flags[flag] = bool(re.search(pattern, help_text))
+            result["available"] = True
+        except RuntimeBridgeError as exc:
+            result["probeError"] = str(exc)
+        return result
 
     def run_prompt(
         self,
@@ -83,8 +112,10 @@ class AgyClient:
         timeout_seconds=300,
         project_path=None,
         new_project=False,
+        stream=False,
+        on_event=None,
     ):
-        arguments = ["-p", prompt, "--output-format", "json"]
+        arguments = ["-p", prompt, "--output-format", "stream-json" if stream else "json"]
         if conversation_id:
             arguments.append(f"--conversation={conversation_id}")
         if project_id:
@@ -103,16 +134,153 @@ class AgyClient:
             cwd = Path(project_path).expanduser().resolve()
             if not cwd.is_dir():
                 raise RuntimeBridgeError(f"项目目录不存在或不是目录: {cwd}")
-        raw = self.invoke(arguments, timeout_seconds=timeout_seconds + 10, cwd=cwd)
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeBridgeError("Antigravity CLI 未返回有效 JSON") from exc
+        if stream:
+            result, diagnostics = self._stream_prompt(arguments, timeout_seconds, cwd, on_event)
+        else:
+            process = self.invoke(
+                arguments, timeout_seconds=timeout_seconds + 10, cwd=cwd, return_process=True
+            )
+            diagnostics = process.stderr or ""
+            try:
+                result = json.loads(process.stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeBridgeError("Antigravity CLI 未返回有效 JSON") from exc
         if not isinstance(result, dict):
             raise RuntimeBridgeError("Antigravity CLI JSON 根节点必须是对象")
         if result.get("status") != "SUCCESS":
-            raise RuntimeBridgeError(result.get("error") or "Antigravity 任务未成功完成")
+            detail = result.get("error") or "Antigravity 任务未成功完成"
+            if diagnostics.strip():
+                detail = f"{detail}\nCLI 诊断: {diagnostics.strip()[-8192:]}"
+            raise RuntimeBridgeError(detail)
+        if diagnostics.strip():
+            result["diagnostics"] = diagnostics.strip()[-8192:]
         return result
+
+    def _stream_prompt(self, arguments, timeout_seconds, cwd, on_event):
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            process = self.popen(
+                [self.executable, *arguments],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                cwd=str(cwd) if cwd else None,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeBridgeError(f"无法执行 Antigravity CLI: {exc}") from exc
+        messages = queue.Queue(maxsize=128)
+        stopped = threading.Event()
+        diagnostics = [""]
+
+        def enqueue(kind, value):
+            while not stopped.is_set():
+                try:
+                    messages.put((kind, value), timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+        def read_stdout():
+            try:
+                for line in process.stdout:
+                    if stopped.is_set():
+                        return
+                    enqueue("line", line)
+            except (OSError, ValueError) as exc:
+                enqueue("error", exc)
+            finally:
+                enqueue("end", None)
+
+        def read_stderr():
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            try:
+                while True:
+                    # 按可用字节读取，短诊断无需等待缓冲区填满；增量解码保留跨块中文。
+                    chunk = process.stderr.buffer.read1(4096)
+                    if not chunk:
+                        diagnostics[0] = (diagnostics[0] + decoder.decode(b"", final=True))[-8192:]
+                        break
+                    diagnostics[0] = (diagnostics[0] + decoder.decode(chunk))[-8192:]
+            except (OSError, ValueError) as exc:
+                enqueue("error", exc)
+
+        readers = [threading.Thread(target=read_stdout, daemon=True),
+                   threading.Thread(target=read_stderr, daemon=True)]
+        result = None
+        initialized = False
+        failure = None
+        try:
+            for reader in readers:
+                reader.start()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeBridgeError("Antigravity CLI 流式执行超时")
+                try:
+                    kind, value = messages.get(timeout=remaining)
+                except queue.Empty as exc:
+                    raise RuntimeBridgeError("Antigravity CLI 流式执行超时") from exc
+                if kind == "end":
+                    break
+                if kind == "error":
+                    raise RuntimeBridgeError(f"无法读取 Antigravity CLI 流式输出: {value}")
+                if not value.strip():
+                    continue
+                try:
+                    event = json.loads(value)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeBridgeError("Antigravity CLI 流式输出包含无效 JSON") from exc
+                if not isinstance(event, dict):
+                    raise RuntimeBridgeError("Antigravity CLI 流式事件必须是对象")
+                event_type = event.get("event")
+                if event_type not in ("init", "step_update", "result"):
+                    raise RuntimeBridgeError(f"Antigravity CLI 流式事件类型无效: {event_type}")
+                if not isinstance(event.get(event_type), dict):
+                    raise RuntimeBridgeError(f"Antigravity CLI {event_type} 事件载荷无效")
+                if result is not None or (event_type != "init" and not initialized):
+                    raise RuntimeBridgeError("Antigravity CLI 流式事件顺序无效")
+                if event_type == "init":
+                    if initialized or not isinstance(event.get("conversation_id"), str) or not event["conversation_id"]:
+                        raise RuntimeBridgeError("Antigravity CLI init 事件缺少会话 ID 或重复出现")
+                    initialized = True
+                if event_type == "result":
+                    result = event["result"]
+                if on_event:
+                    try:
+                        on_event(event)
+                    except Exception as exc:
+                        raise RuntimeBridgeError(f"Antigravity CLI 流式事件回调失败: {exc}") from exc
+            try:
+                returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeBridgeError("Antigravity CLI 流式执行超时") from exc
+            readers[1].join(timeout=max(0, deadline - time.monotonic()))
+            if readers[1].is_alive():
+                raise RuntimeBridgeError("Antigravity CLI 流式诊断读取超时")
+            if returncode:
+                raise RuntimeBridgeError(f"Antigravity CLI 退出码 {returncode}")
+            if result is None:
+                raise RuntimeBridgeError("Antigravity CLI 流式输出缺少 result 事件")
+            return result, diagnostics[0]
+        except RuntimeBridgeError as exc:
+            failure = exc
+            raise
+        finally:
+            stopped.set()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+            for reader in readers:
+                if reader.ident is not None:
+                    reader.join(timeout=1)
+            for pipe in (process.stdout, process.stderr):
+                if pipe:
+                    pipe.close()
+            if failure is not None and diagnostics[0].strip():
+                failure.args = (f"{failure}\nCLI 诊断: {diagnostics[0].strip()[-8192:]}",)
 
     def list_models(self):
         raw = self.invoke(["models"], timeout_seconds=30)
@@ -302,7 +470,9 @@ def runtime_summary():
             "version": sys.version.split()[0],
         },
         "playwright": {"available": playwright_available},
-        "agy": {"available": bool(agy), "path": agy},
+        "agy": AgyClient(executable=agy).capabilities() if agy else {
+            "available": False, "path": None, "version": None, "flags": {},
+        },
         "sidecar": {
             "configured": endpoint.is_file(),
             "endpointFile": str(endpoint),
