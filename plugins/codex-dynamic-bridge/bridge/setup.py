@@ -4,13 +4,15 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from bridge.runtime import find_agy
+from bridge.runtime import AgyClient, RuntimeBridgeError, find_agy
+from bridge.state import file_lock
 
 
 WINDOWS_INSTALLER_URL = "https://antigravity.google/cli/install.ps1"
@@ -34,6 +36,82 @@ def default_agy_install_dir(env=None):
     return (codex_home / "tools" / "agy").expanduser().resolve()
 
 
+def agy_version(executable, runner=subprocess.run):
+    if not executable:
+        return None
+    try:
+        raw = AgyClient(executable=str(executable), runner=runner).invoke(
+            ["--version"], timeout_seconds=10
+        )
+    except RuntimeBridgeError:
+        return None
+    match = re.search(r"\b(\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?)", raw)
+    return match.group(1) if match else None
+
+
+def version_key(version):
+    if not version:
+        return None
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9.-]+))?(?:\+[A-Za-z0-9.-]+)?", version)
+    if not match:
+        return None
+    prerelease = tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in (match.group(4) or "").split(".") if part
+    )
+    return (*map(int, match.groups()[:3]), match.group(4) is None, prerelease)
+
+
+def agy_install_status(
+    install_dir=None,
+    env=None,
+    check_update=False,
+    platform_name=None,
+    machine_name=None,
+    opener=urlopen,
+    runner=subprocess.run,
+):
+    source_env = env
+    env = os.environ if env is None else env
+    platform_name = os.name if platform_name is None else platform_name
+    directory = Path(install_dir or default_agy_install_dir(env)).expanduser().resolve()
+    managed_executable = directory / ("agy.exe" if platform_name == "nt" else "agy")
+    executable = find_agy(source_env) if install_dir is None else (
+        str(managed_executable) if managed_executable.is_file() else None
+    )
+    managed = bool(executable and Path(executable).resolve() == managed_executable)
+    version = agy_version(executable, runner=runner)
+    result = {
+        "available": bool(executable),
+        "path": executable,
+        "defaultInstallDir": str(default_agy_install_dir(env)),
+        "managed": managed,
+        "installedVersion": version,
+    }
+    if not check_update:
+        return result
+    if platform_name != "nt":
+        result["updateCheckError"] = "官方发布清单的版本与完整性检查目前支持 Windows"
+        return result
+    try:
+        manifest = read_windows_manifest(machine_name=machine_name, opener=opener)
+        matches = bool(
+            executable and sha512_file(executable) == manifest["sha512"]
+        )
+        current_key, latest_key = version_key(version), version_key(manifest["version"])
+        result.update({
+            "latestVersion": manifest["version"],
+            "updateAvailable": not matches and not (
+                current_key is not None and latest_key is not None and current_key > latest_key
+            ),
+            "integrityMatchesManifest": matches,
+            "manifest": manifest["manifest"],
+        })
+    except (OSError, SetupError) as exc:
+        result["updateCheckError"] = str(exc)
+    return result
+
+
 def validate_install_dir(path, env=None, allow_system_drive=False, platform_name=None):
     env = os.environ if env is None else env
     platform_name = os.name if platform_name is None else platform_name
@@ -46,6 +124,38 @@ def validate_install_dir(path, env=None, allow_system_drive=False, platform_name
                 "或在明确授权后传入 --allow-system-drive"
             )
     return path
+
+
+def clean_agy_cache(install_dir=None, env=None, allow_system_drive=False, platform_name=None):
+    directory = Path(install_dir or default_agy_install_dir(env)).expanduser().absolute()
+    cache_dir = directory.parent / "cache" / "agy-staging"
+    result = {"cacheDirectory": str(cache_dir), "removed": [], "skipped": []}
+    for path in (directory, cache_dir, *cache_dir.parents):
+        if path.is_symlink() or (os.name == "nt" and path.exists()
+                                 and path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            result["skipped"].append({"path": str(path), "reason": "symbolic_link"})
+            return result
+    validate_install_dir(directory, env, allow_system_drive, platform_name)
+    if not cache_dir.exists():
+        return result
+    if not cache_dir.is_dir():
+        result["skipped"].append({"path": str(cache_dir), "reason": "not_directory"})
+        return result
+    for path in sorted(cache_dir.iterdir()):
+        if not re.fullmatch(r"agy-[A-Za-z0-9._-]+\.(?:partial|verified)", path.name):
+            continue
+        if path.is_symlink() or not path.is_file():
+            result["skipped"].append({"path": str(path), "reason": "not_regular_file"})
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            result["skipped"].append({"path": str(path), "reason": str(exc)})
+        else:
+            result["removed"].append(str(path))
+    return result
 
 
 def read_installer(url, opener=urlopen):
@@ -152,18 +262,22 @@ def sha512_file(path):
 
 
 def verified_staging_digest(staging_path, expected_sha512):
-    if not staging_path.is_file():
+    try:
+        if not staging_path.is_file():
+            return None
+        size = staging_path.stat().st_size
+        if not 0 < size <= MAX_BINARY_BYTES:
+            return None
+        digest = sha512_file(staging_path)
+        if digest != expected_sha512:
+            return None
+        with staging_path.open("rb") as stream:
+            if stream.read(2) != b"MZ":
+                raise SetupError("agy 下载文件不是有效的 Windows 可执行文件")
+        return digest
+    except FileNotFoundError:
+        # 已验证的共享缓存可能刚被另一个安装消费，重新下载即可。
         return None
-    size = staging_path.stat().st_size
-    if not 0 < size <= MAX_BINARY_BYTES:
-        return None
-    digest = sha512_file(staging_path)
-    if digest != expected_sha512:
-        return None
-    with staging_path.open("rb") as stream:
-        if stream.read(2) != b"MZ":
-            raise SetupError("agy 下载文件不是有效的 Windows 可执行文件")
-    return digest
 
 
 def download_verified_binary(
@@ -322,33 +436,111 @@ def install_windows_agy(
     prefer_curl=True,
 ):
     manifest = read_windows_manifest(machine_name=machine_name, opener=opener)
-    install_dir.mkdir(parents=True, exist_ok=True)
-    safe_version = re.sub(r"[^A-Za-z0-9._-]", "_", manifest["version"])
-    staging_path = (
-        install_dir.parent
-        / "cache"
-        / "agy-staging"
-        / f"agy-{safe_version}.partial"
-    )
-    digest = download_verified_binary_with_curl(
-        manifest["url"],
-        manifest["sha512"],
-        staging_path,
-        env=env,
-        runner=runner,
-        fallback_opener=opener,
-        prefer_curl=prefer_curl,
-    )
+    install_dir = Path(install_dir)
     executable = install_dir / "agy.exe"
-    os.replace(staging_path, executable)
-    return {
-        "available": True,
-        "installed": True,
-        "path": str(executable.resolve()),
-        "version": manifest["version"],
-        "manifest": manifest["manifest"],
-        "sha512": digest,
-    }
+
+    def current_installation():
+        if not executable.is_file():
+            return None, None, None
+        stat = executable.stat()
+        fingerprint = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        digest = sha512_file(executable)
+        version = manifest["version"] if digest == manifest["sha512"] else agy_version(executable, runner)
+        return fingerprint, digest, version
+
+    def result(installed, digest, version, **extra):
+        return {
+            "available": executable.is_file(),
+            "installed": installed,
+            "updated": installed and initially_installed,
+            "managed": True,
+            "path": str(executable.resolve()),
+            "version": version,
+            "installedVersion": version,
+            "latestVersion": manifest["version"],
+            "manifest": manifest["manifest"],
+            "sha512": digest,
+            **extra,
+        }
+
+    def already_current(digest, version):
+        current_key, latest_key = version_key(version), version_key(manifest["version"])
+        return digest == manifest["sha512"] or (
+            current_key is not None and latest_key is not None and current_key > latest_key
+        )
+
+    initially_installed = executable.is_file()
+    _, current_digest, current_version = current_installation()
+    if already_current(current_digest, current_version):
+        return result(False, current_digest, current_version, updateAvailable=False)
+    install_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = install_dir.parent / "cache" / "agy-staging"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    ready_path = cache_dir / f"agy-{manifest['sha512']}.verified"
+    staging_path = cache_dir / f"agy-{manifest['sha512'][:16]}-{uuid.uuid4().hex}.partial"
+    cache_source = None
+    preserve_staging = False
+
+    def discard_consumed_cache():
+        if cache_source is not None:
+            try:
+                if verified_staging_digest(cache_source, manifest["sha512"]):
+                    cache_source.unlink(missing_ok=True)
+            except OSError:
+                pass  # 正在使用的完整缓存留待后续 clean 清理。
+
+    try:
+        candidates = [ready_path, *cache_dir.glob(f"agy-{manifest['sha512'][:16]}-*.partial")]
+        for candidate in candidates:
+            if verified_staging_digest(candidate, manifest["sha512"]):
+                try:
+                    shutil.copyfile(candidate, staging_path)
+                except FileNotFoundError:
+                    continue  # 并发安装已消费缓存，继续独立下载。
+                cache_source = candidate
+                break
+        digest = download_verified_binary_with_curl(
+            manifest["url"], manifest["sha512"], staging_path,
+            env=env, runner=runner, fallback_opener=opener, prefer_curl=prefer_curl,
+        )
+        with staging_path.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        while True:
+            fingerprint, current_digest, current_version = current_installation()
+            if already_current(current_digest, current_version):
+                discard_consumed_cache()
+                return result(False, current_digest, current_version, updateAvailable=False)
+            try:
+                with file_lock(executable):
+                    stat = executable.stat() if executable.is_file() else None
+                    latest_fingerprint = (stat.st_ino, stat.st_size, stat.st_mtime_ns) if stat else None
+                    if fingerprint != latest_fingerprint:
+                        continue
+                    # 下载和 hash 均在锁外完成；这里只原子替换单个文件。
+                    os.replace(staging_path, executable)
+            except PermissionError as exc:
+                try:
+                    with file_lock(ready_path):
+                        os.replace(staging_path, ready_path)
+                    pending_path = ready_path
+                    if cache_source != ready_path:
+                        discard_consumed_cache()
+                except OSError:
+                    if cache_source is not None and verified_staging_digest(cache_source, manifest["sha512"]):
+                        pending_path = cache_source
+                    else:
+                        preserve_staging = True
+                        pending_path = staging_path
+                return result(
+                    False, current_digest, current_version,
+                    updateAvailable=True, pending=True,
+                    stagingPath=str(pending_path), error=f"agy 正在被使用，已保留验证完成的文件供重试: {exc}",
+                )
+            discard_consumed_cache()
+            return result(True, digest, manifest["version"], updateAvailable=False)
+    finally:
+        if not preserve_staging:
+            staging_path.unlink(missing_ok=True)
 
 
 def ensure_agy(
@@ -360,15 +552,25 @@ def ensure_agy(
     prefer_curl=True,
     opener=urlopen,
     runner=subprocess.run,
+    update=False,
 ):
+    source_env = env
     env = dict(os.environ if env is None else env)
-    existing = find_agy(env)
-    if existing:
-        return {"available": True, "installed": False, "path": existing}
-
     platform_name = os.name if platform_name is None else platform_name
+    selected_dir = Path(install_dir or default_agy_install_dir(env)).expanduser().resolve()
+    executable = selected_dir / ("agy.exe" if platform_name == "nt" else "agy")
+    existing = find_agy(source_env) if install_dir is None else (
+        str(executable) if executable.is_file() else None
+    )
+    managed = bool(existing and Path(existing).resolve() == executable)
+    if existing and (not update or not managed):
+        result = {"available": True, "installed": False, "updated": False, "path": existing, "managed": managed}
+        if update and not managed:
+            result["updateSkipped"] = "external_managed"
+        return result
+
     install_dir = validate_install_dir(
-        install_dir or default_agy_install_dir(env),
+        selected_dir,
         env=env,
         allow_system_drive=allow_system_drive,
         platform_name=platform_name,
@@ -382,6 +584,13 @@ def ensure_agy(
             runner=runner,
             prefer_curl=prefer_curl,
         )
+
+    if existing:
+        return {
+            "available": True, "installed": False, "updated": False,
+            "path": existing, "managed": True,
+            "updateSkipped": "官方发布清单的幂等更新目前支持 Windows",
+        }
 
     install_dir.parent.mkdir(parents=True, exist_ok=True)
     suffix = ".sh"
@@ -419,6 +628,8 @@ def ensure_agy(
     return {
         "available": True,
         "installed": True,
+        "updated": False,
+        "managed": True,
         "path": str(executable.resolve()),
         "installer": installer_url,
     }
