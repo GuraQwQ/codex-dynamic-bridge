@@ -4,8 +4,8 @@ import uuid
 from pathlib import Path
 
 from bridge.state import (
-    StateError, after_event, atomic_write_json, completed_event,
-    default_data_dir, event_time, file_lock, utc_now,
+    StateError, after_event, atomic_write_json,
+    default_data_dir, event_time, execution_state, file_lock, native_stream_events, utc_now,
 )
 
 
@@ -57,7 +57,7 @@ class SubmissionStore:
             atomic_write_json(path, receipt)
             return receipt
 
-    def dispatch(self, action, backend, conversation_id, callback, tasks):
+    def dispatch(self, action, backend, conversation_id, callback, tasks, events=None):
         receipt = {
             "submissionId": str(uuid.uuid4()), "conversationId": conversation_id,
             "action": action, "backend": backend, "submittedAt": utc_now(),
@@ -69,12 +69,46 @@ class SubmissionStore:
             tasks.upsert({"conversationId": conversation_id,
                           "submissionId": receipt["submissionId"],
                           "lastSubmittedAt": receipt["submittedAt"], "status": "dispatching"})
+
+        progress = {}
+
+        def observe(message):
+            nonlocal conversation_id, receipt
+            if message.get("event") == "init":
+                native_id = message.get("conversation_id")
+                if not isinstance(native_id, str) or not native_id:
+                    raise StateError("CLI 初始化事件缺少 conversation ID")
+                receipt = self.bind(receipt["submissionId"], native_id)
+                conversation_id = native_id
+                tasks.upsert({"conversationId": native_id,
+                              "submissionId": receipt["submissionId"],
+                              "lastSubmittedAt": receipt["submittedAt"], "status": "running"})
+            elif message.get("event") == "result":
+                native_id = message.get("result", {}).get("conversation_id")
+                if native_id and native_id != conversation_id:
+                    raise StateError("CLI 最终事件的会话 ID 与已绑定回执不一致")
+            records = []
+            for event in native_stream_events(message, conversation_id):
+                key = (event["kind"], event["conversationId"], event.get("stepIdx"))
+                signature = {field: value for field, value in event.items() if field != "observedAt"}
+                # 文本分块常重复同一状态；仅保存状态变化，避免每个 token 都重写账本。
+                if progress.get(key) == signature:
+                    continue
+                progress[key] = signature
+                records.append(event)
+            if records:
+                events.import_events(records)
+                tasks.sync_events(records)
+
         try:
-            result = callback()
-            conversation_id = (
+            result = callback(observe) if events is not None else callback()
+            result_id = (
                 result.get("conversationId") or result.get("conversation_id")
-                or result.get("detail", {}).get("conversationId") or conversation_id
+                or result.get("detail", {}).get("conversationId")
             )
+            if result_id and conversation_id and result_id != conversation_id:
+                raise StateError("最终返回的会话 ID 与已绑定回执不一致")
+            conversation_id = result_id or conversation_id
         except BaseException as exc:
             receipt = self.update(receipt["submissionId"], delivery="outcome_unknown")
             if conversation_id:
@@ -104,11 +138,7 @@ class SubmissionStore:
             if later:
                 observed = [event for event in observed if event_time(event["observedAt"]) < min(later)]
         latest = observed[-1] if observed else None
-        execution = "unobserved"
-        if completed_event(observed):
-            execution = "stopped"
-        elif latest:
-            execution = "waiting_approval" if latest.get("approvalState") == "requested" else "running"
+        execution = execution_state(observed)
         review = dict((receipt or {}).get("review", {"verdict": "unverified"}))
         if review.get("evidencePath"):
             try:
@@ -118,7 +148,9 @@ class SubmissionStore:
             if not matches:
                 review["recordedVerdict"] = review["verdict"]
                 review["verdict"] = "stale"
-        return {"conversationId": conversation_id, "submission": receipt,
+        metadata = {key: next((event[key] for event in reversed(observed) if key in event), None)
+                    for key in ("parentConversationId", "workspacePaths", "workspaceUris")}
+        return {"conversationId": conversation_id, "submission": receipt, **metadata,
                 "execution": execution, "latestEvent": latest, "review": review,
                 "eventAttribution": "after_submission" if receipt else "untracked"}
 

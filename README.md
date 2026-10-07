@@ -43,7 +43,7 @@ codex plugin add codex-dynamic-bridge@codex-dynamic-bridge
 使用 Codex Dynamic Bridge 完成此任务；如果完整能力尚未装载，自动安装官方 agy 并注册全局 Companion 到 default-cli-project，我授权此次装载
 ```
 
-Agent 会先运行只读状态检查，再在本次明确授权下执行 `setup ensure --confirm-setup`。`agy` 默认安装到 `$CODEX_HOME\tools\agy`；Windows 会拒绝未授权的系统盘目标，并按官方 manifest 校验 SHA-512。Companion 只需全局注册一次，不需要逐项目安装，也不会热注入 Electron 进程。
+Agent 会先运行只读状态检查，再在本次明确授权下执行 `setup install --confirm-setup`。`agy` 默认安装到 `$CODEX_HOME\tools\agy`；Windows 会拒绝未授权的系统盘目标，并按官方 manifest 校验 SHA-512。Companion 只需全局注册一次，不需要逐项目安装，也不会热注入 Electron 进程。
 
 如果 `CODEX_HOME` 尚未设置且不希望工具落到系统盘，先选择非系统盘目录，例如：
 
@@ -114,6 +114,22 @@ python -m bridge.cli task record-review --submission-id <id> --verdict passed --
 
 投递已接受、观察到停止、验收通过是三个独立状态。测试与评审由监工使用宿主工具执行，插件只保存回执与证据摘要；不确定结果不自动重发。周期监工优先用宿主计划任务，保留现有 Sidecar 调度但不新增调度服务。完整流程见 [监工生命周期](plugins/codex-dynamic-bridge/skills/codex-dynamic-bridge/references/supervision.md)。
 
+### 新版 Antigravity 对接
+
+`doctor.agy` 报告实际版本与命令能力；Companion 0.5.0 新增模型调用开始事件和调用计数。CLI 成功结果附带执行诊断，工具未获权限时仍需检查实际执行证据。
+
+```powershell
+python -m bridge.cli setup status --check-update
+python -m bridge.cli setup install --refresh-agy --confirm-setup
+python -m bridge.cli setup clean --confirm-clean
+python -m bridge.cli conversation new --backend agy --stream --project-id <project-id> --prompt-stdin --confirm-create
+python -m bridge.cli activity --conversation-id <id>
+```
+
+流式 `init` 立即关联会话与回执，状态实时入账；Bridge 仍输出最终 JSON。`activity.agents` 返回父子关系、角色和实际工作区，支持按子 Agent worktree 验收。CLI 回合返回为 `turn_completed`，Hook 确认完全空闲才为 `stopped`；两者均不等于验收通过。
+
+安装入口统一为 `setup install`；加 `--refresh-agy` 时按发布清单核对文件摘要。刷新保留外部管理的 CLI，指定 `--agy-dir` 才选择其他目录。程序占用时返回待重试状态并保留验证完成的缓存。`setup clean` 只清理本安装器的下载缓存；生成的 Hook 也参与 Companion 更新检查。
+
 ### 能力层级
 
 首先运行：
@@ -130,7 +146,7 @@ python -m bridge.cli doctor
 
 若任务需要监工、立即追加补充或第一时间处理审批，且桌面页正在运行，优先使用 Desktop CDP 的 `open-new`/`send-now`，它们在 UI 接受输入后立即返回，Codex 可马上等待 Hook；Companion/`agy` 更适合不需实时干预的 headless 任务。
 
-未安装可选后端时，`doctor` 会报告能力缺口。只有用户明确要求使用本插件完成任务并授权完整装载时，Agent 才可执行 `setup ensure --confirm-setup`；普通发现或只读请求不能触发安装。写操作开始后不会跨后端自动重试。
+未安装可选后端时，`doctor` 会报告能力缺口。只有用户明确要求使用本插件完成任务并授权完整装载时，Agent 才可执行 `setup install --confirm-setup`；普通发现或只读请求不能触发安装。写操作开始后不会跨后端自动重试。
 
 ### 安装与验证
 
@@ -217,7 +233,7 @@ P1-P3 领域命令：
 # 能力探测
 python -m bridge.cli doctor
 python -m bridge.cli setup status
-python -m bridge.cli setup ensure --confirm-setup
+python -m bridge.cli setup install --confirm-setup
 
 # 即使尚无会话，也发现可信 Antigravity 外壳页并从中创建第一个任务
 python -m bridge.cli discover-pages
@@ -453,7 +469,7 @@ Antigravity 的 DOM 可能变化。先用 `control inspect` 和只读命令重�
 ```powershell
 git clone https://github.com/GuraQwQ/codex-dynamic-bridge.git
 Set-Location .\codex-dynamic-bridge\plugins\codex-dynamic-bridge
-python -m unittest bridge.self_test bridge.supervision_test
+python -m unittest bridge.self_test bridge.supervision_test bridge.stream_test bridge.runtime_test bridge.setup_test
 ```
 
 项目结构：
@@ -483,7 +499,7 @@ python -m unittest bridge.self_test bridge.supervision_test
 ```powershell
 Set-Location .\plugins\codex-dynamic-bridge
 python -m compileall -q bridge
-python -m unittest bridge.self_test bridge.supervision_test
+python -m unittest bridge.self_test bridge.supervision_test bridge.stream_test bridge.runtime_test bridge.setup_test
 Set-Location .\companion\antigravity-plugin\sidecars\codex-bridge
 python .\self_test.py
 ```
@@ -527,7 +543,7 @@ For task creation, model/project control, Hook events, and approval notification
 Use Codex Dynamic Bridge to complete this task. If full capabilities are not loaded, automatically install the official agy and register the global Companion for default-cli-project; I authorize this setup.
 ```
 
-The agent checks status first, then runs `setup ensure --confirm-setup` only under that explicit authorization. `agy` defaults to `$CODEX_HOME\tools\agy`; on Windows, an unapproved system-drive target is rejected and the binary is verified against the official manifest with SHA-512. Companion registration is global and one-time, not per project, and does not inject into Electron.
+The agent checks status first, then runs `setup install --confirm-setup` only under that explicit authorization. `agy` defaults to `$CODEX_HOME\tools\agy`; on Windows, an unapproved system-drive target is rejected and the binary is verified against the official manifest with SHA-512. Companion registration is global and one-time, not per project, and does not inject into Electron.
 
 If `CODEX_HOME` is unset and tools must stay off the system drive, set it first, for example:
 
@@ -589,6 +605,14 @@ GPT-5.6 Sol and GPT-6 Astra share the same CLI/CDP foundation. Native computer c
 
 Use `task inspect` to distinguish delivery, observed execution, and review. `task record-review` binds an explicit verdict to a submission and an evidence-file digest; it does not execute tests or prove unchanged source code. Prefer the host's existing scheduler for recurring supervision. See the [supervision lifecycle](plugins/codex-dynamic-bridge/skills/codex-dynamic-bridge/references/supervision.md).
 
+### Updated Antigravity integration
+
+`doctor.agy` reports the actual CLI version and flags. Companion 0.5.0 captures invocation starts and counters. Successful CLI results retain stderr diagnostics, so a returned response does not hide a tool that lacked execution permission.
+
+Use `setup status --check-update` for a read-only release and digest check, and authorized `setup install --refresh-agy --confirm-setup` for idempotent installation. External CLI installations are preserved unless an installation directory is explicitly selected. Busy files retain verified staging data for retry; `setup clean --confirm-clean` removes only installer download caches.
+
+Single-run tasks can use `conversation new --backend agy --stream --project-id <project-id> --prompt-stdin --confirm-create`. The native init event binds the receipt immediately; progress is persisted while Bridge stdout remains the final JSON. `activity --conversation-id <id>` includes observed child agents and their actual workspaces. A CLI result reports `turn_completed`; only an idle Hook confirms `stopped`, and neither proves acceptance tests passed.
+
 ### Capability tiers
 
 Start with:
@@ -605,7 +629,7 @@ The plugin detects three backends:
 
 For supervision, immediate supplements, or first-response approval handling on a running desktop page, prefer Desktop CDP `open-new`/`send-now`; they return as soon as the UI accepts input so Codex can immediately wait for Hooks. Use Companion/`agy` for headless work that does not require live intervention.
 
-When an optional backend is absent, `doctor` reports it. The agent may run `setup ensure --confirm-setup` only when the user explicitly asks the plugin to complete a task and authorizes full setup; ordinary discovery and read-only requests never authorize installation. A failed write is never retried automatically through another backend.
+When an optional backend is absent, `doctor` reports it. The agent may run `setup install --confirm-setup` only when the user explicitly asks the plugin to complete a task and authorizes full setup; ordinary discovery and read-only requests never authorize installation. A failed write is never retried automatically through another backend.
 
 ### Install and verify
 
@@ -692,7 +716,7 @@ P1-P3 domain commands:
 # Capability discovery
 python -m bridge.cli doctor
 python -m bridge.cli setup status
-python -m bridge.cli setup ensure --confirm-setup
+python -m bridge.cli setup install --confirm-setup
 
 # Discover a trusted Antigravity shell and create the first task even when no conversation exists
 python -m bridge.cli discover-pages
@@ -928,7 +952,7 @@ Antigravity's DOM may change. Re-observe the page with `control inspect` and rea
 ```powershell
 git clone https://github.com/GuraQwQ/codex-dynamic-bridge.git
 Set-Location .\codex-dynamic-bridge\plugins\codex-dynamic-bridge
-python -m unittest bridge.self_test bridge.supervision_test
+python -m unittest bridge.self_test bridge.supervision_test bridge.stream_test bridge.runtime_test bridge.setup_test
 ```
 
 Repository layout:
@@ -958,7 +982,7 @@ Run checks:
 ```powershell
 Set-Location .\plugins\codex-dynamic-bridge
 python -m compileall -q bridge
-python -m unittest bridge.self_test bridge.supervision_test
+python -m unittest bridge.self_test bridge.supervision_test bridge.stream_test bridge.runtime_test bridge.setup_test
 Set-Location .\companion\antigravity-plugin\sidecars\codex-bridge
 python .\self_test.py
 ```

@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MAX_BODY_BYTES = 1_048_576
 ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 EVENT_FIELDS = {
@@ -27,11 +27,22 @@ EVENT_FIELDS = {
     "fullyIdle",
     "error",
     "stepIdx",
+    "invocationNum",
+    "initialNumSteps",
+    "executionNum",
     "toolName",
     "projectId",
     "status",
     "approvalState",
     "observedAt",
+    "source",
+    "parentConversationId",
+    "agentRole",
+    "agentType",
+    "agentState",
+    "workspaceUris",
+    "cliStatus",
+    "stepState",
 }
 
 
@@ -207,7 +218,7 @@ def scheduler_loop():
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CodexDynamicBridge/0.2"
+    server_version = f"CodexDynamicBridge/{VERSION}"
 
     def log_message(self, format_string, *args):
         return

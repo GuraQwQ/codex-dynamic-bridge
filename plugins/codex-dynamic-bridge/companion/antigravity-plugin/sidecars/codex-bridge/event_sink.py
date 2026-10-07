@@ -20,8 +20,19 @@ EVENT_FIELDS = {
     "fullyIdle",
     "error",
     "stepIdx",
+    "invocationNum",
+    "initialNumSteps",
+    "executionNum",
     "projectId",
     "status",
+    "source",
+    "parentConversationId",
+    "agentRole",
+    "agentType",
+    "agentState",
+    "workspaceUris",
+    "cliStatus",
+    "stepState",
 }
 
 

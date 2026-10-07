@@ -1175,10 +1175,10 @@ class BridgeTestCase(unittest.TestCase):
             events["PreToolUse"][0]["matcher"], "run_command|ask_permission"
         )
         self.assertIn("hooks", events["PostToolUse"][0])
+        self.assertIn("command", events["PreInvocation"][0])
         self.assertIn("command", events["PostInvocation"][0])
         self.assertIn("command", events["Stop"][0])
-        self.assertIn(str(destination), events["Stop"][0]["command"])
-        self.assertNotIn(".tmp", events["Stop"][0]["command"])
+        self.assertIn(str(destination / "sidecars" / "codex-bridge" / "event_sink.py"), events["Stop"][0]["command"])
 
         (destination / "stale.txt").write_text("旧文件", encoding="utf-8")
         second = companion.install_global("project-2", env)
@@ -1202,7 +1202,7 @@ class BridgeTestCase(unittest.TestCase):
         stale = destination / "stale.py"
         stale.write_text("旧文件\n", encoding="utf-8")
         with mock.patch.object(companion, "desktop_running", return_value=True):
-            with self.assertRaisesRegex(companion.CompanionError, "完全退出后重试"):
+            with self.assertRaisesRegex(companion.CompanionError, "重试安装"):
                 companion.install_global("project-1", env)
         self.assertEqual(stale.read_text(encoding="utf-8"), "旧文件\n")
 
@@ -1339,11 +1339,51 @@ class BridgeTestCase(unittest.TestCase):
     def test_setup_cli_必须显式确认完整装载(self):
         with self.assertRaises(cli.BridgeError):
             cli.setup_command(
-                argparse.Namespace(setup_action="ensure", confirm_setup=False)
+                argparse.Namespace(setup_action="install", confirm_setup=False)
             )
-        args = cli.build_parser().parse_args(["setup", "ensure", "--confirm-setup"])
+        args = cli.build_parser().parse_args(["setup", "install", "--confirm-setup"])
         self.assertEqual(args.project_id, companion.DEFAULT_PROJECT_ID)
         self.assertIsNone(args.agy_dir)
+
+    def test_companion_生成_hook_变化能更新且活动_sidecar_不被覆盖(self):
+        home = Path(self.temporary_directory.name) / "home"
+        env = {"USERPROFILE": str(home)}
+        first = companion.install_global("project-1", env)
+        destination = Path(first["destination"])
+        hook_path = destination / "hooks.json"
+        hooks = json.loads(hook_path.read_text(encoding="utf-8"))
+        hooks["codex-dynamic-bridge-events"].pop("PreInvocation")
+        state.atomic_write_json(hook_path, hooks)
+        before = hook_path.read_bytes()
+        with mock.patch.object(companion, "desktop_running", return_value=False), mock.patch.object(companion, "endpoint_ready", return_value=True):
+            with self.assertRaisesRegex(companion.CompanionError, "重试安装"):
+                companion.install_global("project-1", env)
+        self.assertEqual(hook_path.read_bytes(), before)
+        with mock.patch.object(companion, "endpoint_ready", return_value=False):
+            self.assertTrue(companion.install_global("project-1", env)["updated"])
+        self.assertIn("PreInvocation", json.loads(hook_path.read_text(encoding="utf-8"))["codex-dynamic-bridge-events"])
+        self.assertFalse(companion.install_global("project-1", env)["updated"])
+
+    def test_setup_状态检查与刷新安装使用相同入口(self):
+        status = cli.build_parser().parse_args(["setup", "status", "--check-update", "--agy-dir", "F:/tools/agy"])
+        install = cli.build_parser().parse_args(["setup", "install", "--refresh-agy", "--confirm-setup"])
+        with mock.patch.object(cli, "agy_install_status", return_value={}) as check, mock.patch.object(cli, "companion_status", return_value={}), mock.patch.object(cli, "print_json", side_effect=lambda value: value):
+            status.func(status)
+        check.assert_called_once_with(install_dir=Path("F:/tools/agy"), check_update=True)
+        with mock.patch.object(cli, "ensure_agy", return_value={"pending": True}) as ensure, mock.patch.object(cli, "companion_status", return_value={}), mock.patch.object(cli, "install_companion_global") as companion_install, mock.patch.object(cli, "print_json", side_effect=lambda value: value):
+            result = install.func(install)
+        self.assertTrue(ensure.call_args.kwargs["update"])
+        self.assertFalse(result["complete"])
+        companion_install.assert_not_called()
+        clean = cli.build_parser().parse_args(["setup", "clean", "--agy-dir", "F:/tools/agy"])
+        with mock.patch.object(cli, "clean_agy_cache") as clear:
+            with self.assertRaises(cli.BridgeError):
+                clean.func(clean)
+            clear.assert_not_called()
+        clean.confirm_clean = True
+        with mock.patch.object(cli, "clean_agy_cache", return_value={"removed": []}) as clear, mock.patch.object(cli, "print_json", side_effect=lambda value: value):
+            clean.func(clean)
+        clear.assert_called_once_with(install_dir=Path("F:/tools/agy"), allow_system_drive=False)
 
     def test_审批响应要求精确事件与显式确认(self):
         with self.assertRaises(cli.BridgeError):

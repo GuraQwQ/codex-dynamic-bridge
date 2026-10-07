@@ -5,6 +5,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 EVENT_FIELDS = {
@@ -20,6 +21,17 @@ EVENT_FIELDS = {
     "projectId",
     "status",
     "approvalState",
+    "source",
+    "invocationNum",
+    "initialNumSteps",
+    "executionNum",
+    "parentConversationId",
+    "agentRole",
+    "agentType",
+    "agentState",
+    "workspaceUris",
+    "cliStatus",
+    "stepState",
 }
 TASK_FIELDS = {
     "conversationId",
@@ -35,6 +47,13 @@ TASK_FIELDS = {
     "lastObservedAt",
     "submissionId",
     "lastSubmittedAt",
+    "lastMetadataAt",
+    "parentConversationId",
+    "agentRole",
+    "agentType",
+    "agentState",
+    "workspaceUris",
+    "cliStatus",
 }
 
 
@@ -59,12 +78,95 @@ def after_event(event, after):
 
 def completed_event(events, after=None):
     latest = max(
-        (event for event in reversed(events) if after_event(event, after)),
+        (event for event in reversed(events) if after_event(event, after)
+         and event.get("kind") != "Subagent"
+         and not (event.get("kind") == "CliResult" and event.get("cliStatus") == "SUCCESS")),
         key=lambda event: event_time(event["observedAt"]), default=None,
     )
     if latest and latest.get("kind") == "Stop" and latest.get("fullyIdle") is True:
         return latest
     return None
+
+
+def execution_state(events):
+    observed = [event for event in events if event.get("kind") != "Subagent"]
+    if not observed:
+        return "unobserved"
+    if completed_event(observed):
+        return "stopped"
+    latest = max(reversed(observed), key=lambda event: event_time(event["observedAt"]))
+    if latest.get("kind") == "CliResult":
+        return {"SUCCESS": "turn_completed", "ERROR": "failed", "INVALID": "failed",
+                "CANCELED": "canceled", "INTERRUPTED": "canceled",
+                "WAITING": "waiting_input", "RUNNING": "running"}.get(
+                    latest.get("cliStatus"), "unobserved")
+    return "waiting_approval" if latest.get("approvalState") == "requested" else "running"
+
+
+def native_stream_events(message, conversation_id):
+    """只提取 CLI 状态与归属，不保存正文、工具参数或子 Agent 日志。"""
+    kind = message.get("event")
+    payload = message.get({"init": "init", "step_update": "step_update", "result": "result"}.get(kind))
+    if not isinstance(payload, dict):
+        return []
+    current_id = message.get("conversation_id") if kind == "init" else payload.get("conversation_id")
+    current_id = current_id or conversation_id
+    if not isinstance(current_id, str) or not current_id:
+        raise StateError("CLI 流式事件缺少 conversation ID")
+    event = {"kind": {"init": "CliInit", "step_update": "CliStep", "result": "CliResult"}[kind],
+             "conversationId": current_id, "source": "agy", "observedAt": utc_now()}
+    if kind == "init":
+        if isinstance(payload.get("cwd"), str) and payload["cwd"]:
+            event["workspacePaths"] = [payload["cwd"]]
+        if isinstance(payload.get("model"), str):
+            event["modelName"] = payload["model"]
+    elif kind == "step_update":
+        if isinstance(payload.get("step_index"), int):
+            event["stepIdx"] = payload["step_index"]
+        if isinstance(payload.get("state"), str):
+            event["stepState"] = payload["state"]
+        if isinstance(payload.get("tool_name"), str):
+            event["toolName"] = payload["tool_name"][:128]
+        error = payload.get("tool_info", {}).get("error") if isinstance(payload.get("tool_info"), dict) else None
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            event["error"] = error["message"][:1024]
+    else:
+        event["cliStatus"] = payload.get("status")
+        if isinstance(payload.get("error"), str):
+            event["error"] = payload["error"][:1024]
+    result = [event]
+    details = payload.get("subagent_info")
+    children = details.get("subagents", []) if isinstance(details, dict) else []
+    for child in children if isinstance(children, list) else []:
+        if not isinstance(child, dict) or not isinstance(child.get("conversation_id"), str):
+            continue
+        child_id = child["conversation_id"]
+        if not child_id or child_id == current_id:
+            continue
+        record = {"kind": "Subagent", "conversationId": child_id,
+                  "parentConversationId": current_id, "source": "agy",
+                  "observedAt": event["observedAt"]}
+        for original, target in (("role", "agentRole"), ("type_name", "agentType"), ("state", "agentState")):
+            if isinstance(child.get(original), str):
+                record[target] = child[original][:128]
+        uris = child.get("workspace_uris")
+        if isinstance(uris, list):
+            record["workspaceUris"] = [uri for uri in uris if isinstance(uri, str)]
+            paths = []
+            for uri in record["workspaceUris"]:
+                parsed = urlparse(uri)
+                if parsed.scheme != "file":
+                    continue
+                path = unquote(parsed.path)
+                if parsed.netloc and parsed.netloc != "localhost":
+                    path = "//" + parsed.netloc + path
+                elif len(path) >= 3 and path[0] == "/" and path[2] == ":":
+                    path = path[1:]
+                paths.append(path)
+            if paths:
+                record["workspacePaths"] = paths
+        result.append(record)
+    return result
 
 
 @contextmanager
@@ -254,9 +356,39 @@ class EventStore:
             time.sleep(poll_seconds)
 
     def summary(self, conversation_id):
-        events = self.list(conversation_id=conversation_id, limit=10_000)
+        all_events = self.list(limit=None)
+        grouped = {}
+        parents = {}
+        for event in all_events:
+            current_id = event["conversationId"]
+            grouped.setdefault(current_id, []).append(event)
+            if event.get("parentConversationId"):
+                parents[current_id] = event["parentConversationId"]
+        events = grouped.get(conversation_id, [])
         if not events:
             raise StateError(f"未找到会话事件: {conversation_id}")
+
+        def describe(current_id):
+            history = grouped[current_id]
+            metadata = {}
+            for name in ("workspacePaths", "workspaceUris", "parentConversationId", "agentRole", "agentType", "agentState"):
+                metadata[name] = next((event[name] for event in reversed(history) if name in event), None)
+            return {"conversationId": current_id, **metadata,
+                    "execution": execution_state(history), "lastObservedAt": history[-1]["observedAt"]}
+
+        descendants = []
+        pending = [conversation_id]
+        seen = {conversation_id}
+        children = {}
+        for child, parent in parents.items():
+            children.setdefault(parent, []).append(child)
+        while pending:
+            current_id = pending.pop()
+            for child in children.get(current_id, []):
+                if child not in seen:
+                    seen.add(child)
+                    pending.append(child)
+                    descendants.append(describe(child))
         tool_counts = {}
         errors = []
         for event in events:
@@ -271,12 +403,12 @@ class EventStore:
             None,
         )
         return {
-            "conversationId": conversation_id,
-            "status": "idle" if completed_event(events) else "running",
+            **describe(conversation_id),
+            "status": "idle" if completed_event(events) else execution_state(events),
             "eventCount": len(events),
-            "model": latest.get("modelName"),
-            "projectId": latest.get("projectId"),
-            "artifactDirectoryPath": latest.get("artifactDirectoryPath"),
+            "model": next((event["modelName"] for event in reversed(events) if event.get("modelName")), None),
+            "projectId": next((event["projectId"] for event in reversed(events) if event.get("projectId")), None),
+            "artifactDirectoryPath": next((event["artifactDirectoryPath"] for event in reversed(events) if event.get("artifactDirectoryPath")), None),
             "lastObservedAt": latest.get("observedAt"),
             "terminationReason": stop.get("terminationReason") if stop else None,
             "toolCounts": dict(sorted(tool_counts.items())),
@@ -285,6 +417,7 @@ class EventStore:
                 for name in ("invoke_subagent", "define_subagent", "manage_subagents", "send_message")
             ),
             "errors": errors[-10:],
+            "agents": sorted(descendants, key=lambda item: item["conversationId"]),
         }
 
 
@@ -325,6 +458,9 @@ class TaskStore:
         }
         normalized["updatedAt"] = utc_now()
         old = tasks.get(normalized["conversationId"], {})
+        if normalized.get("lastMetadataAt") and old.get("lastMetadataAt"):
+            if event_time(normalized["lastMetadataAt"]) < event_time(old["lastMetadataAt"]):
+                return old
         if normalized.get("lastSubmittedAt") and old.get("lastSubmittedAt"):
             if event_time(normalized["lastSubmittedAt"]) < event_time(old["lastSubmittedAt"]):
                 return old
@@ -335,6 +471,8 @@ class TaskStore:
         if normalized.get("lastSubmittedAt") and old.get("lastObservedAt"):
             if event_time(old["lastObservedAt"]) >= event_time(normalized["lastSubmittedAt"]):
                 normalized.pop("status", None)
+        if normalized.get("cliStatus") == "SUCCESS" and old.get("status") == "idle":
+            normalized.pop("status", None)
         merged = {**old, **normalized}
         tasks[normalized["conversationId"]] = merged
         return merged
@@ -358,11 +496,14 @@ class TaskStore:
         records = [{
             "conversationId": event["conversationId"],
             "model": event.get("modelName"),
-            "status": "idle" if event.get("fullyIdle") else event.get("status", "running"),
+            "status": (None if event.get("kind") == "Subagent" else
+                       "idle" if event.get("fullyIdle") else event.get("status") or execution_state([event])),
             "artifactDirectoryPath": event.get("artifactDirectoryPath"),
             "projectId": event.get("projectId"),
             "workspacePaths": event.get("workspacePaths"),
-            "lastObservedAt": event.get("observedAt"),
+            "lastObservedAt": event.get("observedAt") if event.get("kind") != "Subagent" else None,
+            "lastMetadataAt": event.get("observedAt") if event.get("kind") == "Subagent" else None,
+            **{key: event[key] for key in ("parentConversationId", "agentRole", "agentType", "agentState", "workspaceUris", "cliStatus") if key in event},
         } for event in sorted(events, key=lambda item: event_time(item["observedAt"]))]
         return self.upsert_many(records)
 

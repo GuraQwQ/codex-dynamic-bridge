@@ -16,7 +16,7 @@ from bridge.runtime import (
     find_agy,
     runtime_summary,
 )
-from bridge.setup import SetupError, default_agy_install_dir, ensure_agy
+from bridge.setup import SetupError, agy_install_status, clean_agy_cache, ensure_agy
 from bridge.companion import (
     CompanionError,
     DEFAULT_PROJECT_ID,
@@ -530,6 +530,9 @@ def conversation_command(args):
     if args.conversation_action == "new" and not args.confirm_create:
         raise BridgeError("新建会话会修改 Antigravity；请在明确授权后传入 --confirm-create")
     prompt = prompt_from_args(args)
+    stream = getattr(args, "stream", False)
+    if stream and args.backend != "agy":
+        raise BridgeError("流式任务请显式选择 --backend agy --stream")
     if args.conversation_action in {"send", "resume"} and args.backend == "auto":
         try:
             select_sessions(discover_sessions(), args.conversation_id)
@@ -561,7 +564,12 @@ def conversation_command(args):
     backend, client = select_runtime_backend(backend_name, require_agy=require_agy)
     conversation_id = getattr(args, "conversation_id", None)
 
-    def invoke():
+    if stream:
+        capabilities = client.capabilities()
+        if not capabilities["flags"].get("stream-json"):
+            raise BridgeError("当前 agy 未报告 stream-json 能力；请运行 doctor 或检查安装状态")
+
+    def invoke(on_event=None):
         if backend == "sidecar":
             return (client.new_conversation(prompt) if args.conversation_action == "new"
                     else client.send_message(conversation_id, prompt))
@@ -572,10 +580,12 @@ def conversation_command(args):
             timeout_seconds=args.timeout_seconds,
             project_path=getattr(args, "project_path", None),
             new_project=getattr(args, "new_project", False),
+            **({"stream": True, "on_event": on_event} if stream else {}),
         )
 
     result, receipt = SubmissionStore().dispatch(
-        args.conversation_action, backend, conversation_id, invoke, task_store
+        args.conversation_action, backend, conversation_id, invoke, task_store,
+        events=event_store if stream else None,
     )
     conversation_id = receipt["conversationId"]
     if conversation_id:
@@ -718,20 +728,23 @@ def setup_command(args):
     if args.setup_action == "status":
         return print_json(
             {
-                "agy": {
-                    "available": bool(find_agy()),
-                    "path": find_agy(),
-                    "defaultInstallDir": str(default_agy_install_dir()),
-                },
+                "agy": agy_install_status(install_dir=args.agy_dir, check_update=args.check_update),
                 "companion": companion_status(),
             }
         )
+    if args.setup_action == "clean":
+        if not args.confirm_clean:
+            raise BridgeError("清理会删除本安装器的下载缓存；请传入 --confirm-clean")
+        return print_json(clean_agy_cache(install_dir=args.agy_dir, allow_system_drive=args.allow_system_drive))
     if not args.confirm_setup:
         raise BridgeError("完整能力装载会安装 agy 并修改 Antigravity 配置；请传入 --confirm-setup")
     agy = ensure_agy(
         install_dir=args.agy_dir,
         allow_system_drive=args.allow_system_drive,
+        update=args.refresh_agy,
     )
+    if agy.get("pending"):
+        return print_json({"agy": agy, "companion": companion_status(), "complete": False})
     companion = install_companion_global(args.project_id)
     return print_json({"agy": agy, "companion": companion})
 
@@ -1059,6 +1072,7 @@ def build_parser():
     new_conversation_parser.add_argument("--model")
     new_conversation_parser.add_argument("--effort", choices=("low", "medium", "high"))
     new_conversation_parser.add_argument("--agent")
+    new_conversation_parser.add_argument("--stream", action="store_true", help="通过 agy 流式记录进度和提前关联会话")
     new_conversation_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=300)
     new_conversation_parser.add_argument("--confirm-create", action="store_true")
     new_conversation_parser.set_defaults(func=conversation_command)
@@ -1072,6 +1086,7 @@ def build_parser():
     send_conversation_parser.add_argument("--model")
     send_conversation_parser.add_argument("--effort", choices=("low", "medium", "high"))
     send_conversation_parser.add_argument("--agent")
+    send_conversation_parser.add_argument("--stream", action="store_true")
     send_conversation_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=300)
     send_conversation_parser.add_argument("--confirm-send", action="store_true")
     send_conversation_parser.set_defaults(func=conversation_command)
@@ -1088,6 +1103,7 @@ def build_parser():
     resume_conversation_parser.add_argument("--model")
     resume_conversation_parser.add_argument("--effort", choices=("low", "medium", "high"))
     resume_conversation_parser.add_argument("--agent")
+    resume_conversation_parser.add_argument("--stream", action="store_true")
     resume_conversation_parser.add_argument("--timeout-seconds", type=nonnegative_integer, default=300)
     resume_conversation_parser.add_argument("--confirm-send", action="store_true")
     resume_conversation_parser.set_defaults(func=conversation_command)
@@ -1360,13 +1376,21 @@ def build_parser():
     setup_parser = subparsers.add_parser("setup", help="探测或装载 agy 与全局 Companion")
     setup_subparsers = setup_parser.add_subparsers(dest="setup_action", required=True)
     setup_status_parser = setup_subparsers.add_parser("status", help="只读检查完整能力状态")
+    setup_status_parser.add_argument("--agy-dir", type=Path)
+    setup_status_parser.add_argument("--check-update", action="store_true", help="联网读取 Windows 发布清单并核对安装文件")
     setup_status_parser.set_defaults(func=setup_command)
+    setup_clean_parser = setup_subparsers.add_parser("clean", help="清理本安装器管理的下载缓存")
+    setup_clean_parser.add_argument("--agy-dir", type=Path)
+    setup_clean_parser.add_argument("--allow-system-drive", action="store_true")
+    setup_clean_parser.add_argument("--confirm-clean", action="store_true")
+    setup_clean_parser.set_defaults(func=setup_command)
     setup_ensure_parser = setup_subparsers.add_parser(
-        "ensure", help="使用官方安装器装载 agy 并全局注册 Companion"
+        "install", help="幂等安装 agy 并全局注册 Companion"
     )
     setup_ensure_parser.add_argument("--project-id", default=DEFAULT_PROJECT_ID)
     setup_ensure_parser.add_argument("--agy-dir", type=Path)
     setup_ensure_parser.add_argument("--allow-system-drive", action="store_true")
+    setup_ensure_parser.add_argument("--refresh-agy", action="store_true", help="按官方发布清单更新本插件管理的 agy")
     setup_ensure_parser.add_argument("--confirm-setup", action="store_true")
     setup_ensure_parser.set_defaults(func=setup_command)
 

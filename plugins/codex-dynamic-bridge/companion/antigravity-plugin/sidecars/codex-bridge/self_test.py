@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -106,6 +108,65 @@ class SidecarTestCase(unittest.TestCase):
         self.assertEqual(event["toolName"], "run_command")
         self.assertEqual(event["approvalState"], "requested")
         self.assertNotIn("toolCall", event)
+
+    def test_pre_invocation_通过_hook_上报计数且返回空对象(self):
+        endpoint = server.DATA_DIR / "endpoint.json"
+        endpoint.write_text(
+            json.dumps({"url": self.url, "token": self.httpd.token}), encoding="utf-8"
+        )
+        payload = {
+            "conversationId": "conversation-1",
+            "invocationNum": 3,
+            "initialNumSteps": 17,
+            "modelName": "当前模型",
+            "prompt": "不保存的提示词",
+        }
+        result = subprocess.run(
+            [sys.executable, str(Path(event_sink.__file__)), "PreInvocation",
+             "--endpoint-file", str(endpoint)],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+            check=True,
+        )
+        self.assertEqual(json.loads(result.stdout), {})
+        self.assertEqual(result.stderr, "")
+        _, page = self.request("GET", "/v1/events?conversation_id=conversation-1")
+        event = page["events"][0]
+        self.assertEqual(event["kind"], "PreInvocation")
+        self.assertEqual(event["invocationNum"], 3)
+        self.assertEqual(event["initialNumSteps"], 17)
+        self.assertNotIn("prompt", event)
+        self.assertNotIn("executionNum", event)
+        self.assertNotIn("approvalState", event)
+
+        stop = event_sink.sanitize_event("Stop", {
+            "conversationId": "conversation-1", "executionNum": 4, "fullyIdle": True
+        })
+        _, stored = self.request("POST", "/v1/events", stop)
+        self.assertEqual(stored["executionNum"], 4)
+
+    def test_event_保留流式子_agent_元数据(self):
+        metadata = {
+            "source": "agy-stream",
+            "parentConversationId": "parent-1",
+            "agentRole": "检查测试",
+            "agentType": "reviewer",
+            "agentState": "running",
+            "workspaceUris": ["file:///F:/audit"],
+            "cliStatus": "RUNNING",
+            "stepState": "ACTIVE",
+        }
+        event = event_sink.sanitize_event("CliStep", {
+            "conversationId": "child-1", **metadata
+        })
+        _, stored = self.request("POST", "/v1/events", event)
+        _, page = self.request("GET", "/v1/events?conversation_id=child-1")
+        for key, value in metadata.items():
+            self.assertEqual(stored[key], value)
+            self.assertEqual(page["events"][0][key], value)
 
     def test_event_空状态及日志替换后恢复游标(self):
         _, empty = self.request("GET", "/v1/events?after=0")

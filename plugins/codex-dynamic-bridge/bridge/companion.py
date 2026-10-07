@@ -129,10 +129,10 @@ def hook_command(arguments):
     return shlex.join(arguments)
 
 
-def write_hooks(destination, endpoint):
+def hooks_config(destination, endpoint):
     sink = destination / "sidecars" / "codex-bridge" / "event_sink.py"
     events = {}
-    for kind in ("PreToolUse", "PostToolUse", "PostInvocation", "Stop"):
+    for kind in ("PreToolUse", "PostToolUse", "PreInvocation", "PostInvocation", "Stop"):
         entry = {
             "type": "command",
             "command": hook_command(
@@ -145,8 +145,11 @@ def write_hooks(destination, endpoint):
             events[kind] = [{"matcher": matcher, "hooks": [entry]}]
         else:
             events[kind] = [entry]
-    hooks = {"codex-dynamic-bridge-events": events}
-    atomic_write_json(destination / "hooks.json", hooks)
+    return {"codex-dynamic-bridge-events": events}
+
+
+def write_hooks(destination, endpoint):
+    atomic_write_json(destination / "hooks.json", hooks_config(destination, endpoint))
 
 
 def validate_config(config):
@@ -174,7 +177,7 @@ def staged_plugin(destination, endpoint=None):
     return stage
 
 
-def source_matches(destination):
+def source_matches(destination, endpoint):
     source = source_plugin()
     def files(root, generated_hooks=False):
         return {
@@ -189,10 +192,16 @@ def source_matches(destination):
 
     source_files = files(source)
     installed_files = files(destination, generated_hooks=True)
-    return source_files.keys() == installed_files.keys() and all(
+    if not (source_files.keys() == installed_files.keys() and all(
         installed_files[relative].read_bytes() == path.read_bytes()
         for relative, path in source_files.items()
-    )
+    )):
+        return False
+    try:
+        installed_hooks = json.loads((destination / "hooks.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return installed_hooks == hooks_config(destination, endpoint)
 
 
 def status(env=None):
@@ -234,12 +243,12 @@ def install_global(project_id, env=None):
         "projectId": project_id.strip(),
     }
 
-    if destination.exists() and source_matches(destination) and updated == config:
+    if destination.exists() and source_matches(destination, endpoint_file(env)) and updated == config:
         result = status(env)
         result.update({"updated": False, "restartRequired": False})
         return result
-    if destination.exists() and desktop_running(env):
-        raise CompanionError("Antigravity 正在运行且 Companion 有更新；请完全退出后重试安装")
+    if destination.exists() and (desktop_running(env) or endpoint_ready(env)):
+        raise CompanionError("Antigravity 或 Companion Sidecar 正在运行且需要更新；请停止对应实例后重试安装")
 
     stage = staged_plugin(destination, endpoint_file(env))
     backup = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.backup"

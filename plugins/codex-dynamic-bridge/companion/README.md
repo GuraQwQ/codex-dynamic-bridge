@@ -3,7 +3,7 @@
 该伴生插件为 Codex Dynamic Bridge 提供稳定的本机 Sidecar 后端：
 
 - 使用 Antigravity 官方 `agentapi` 新建会话和发送消息。
-- 通过 Hook 接收会话生命周期事件，并在 `run_command`/`ask_permission` 前上报审批请求。
+- 通过 `PreInvocation` 及时观察模型开始执行，接收会话生命周期事件，并在 `run_command`/`ask_permission` 前上报审批请求。
 - 管理最小间隔为 60 秒的本地定时任务。
 - 仅绑定 `127.0.0.1`，每次启动生成随机令牌；普通会话请求不额外记录提示词。
 - 定时任务必须把提示词保存在 Sidecar 私有 `data/schedules.json` 中，但不会持久化模型回复正文。
@@ -19,8 +19,9 @@ python -m bridge.cli companion install-global --confirm-install
 `~/.gemini/config/plugins/codex-dynamic-bridge`，并在 `~/.gemini/config/config.json`
 中合并 `codex-dynamic-bridge/codex-bridge` 的 `enabled` 与 `projectId`。默认使用官方
 `default-cli-project`；其他配置保持不变；
-以后打开任何工作区都不需要重复安装。文件和配置相同时直接返回 `updated: false`；
-已有 Companion 需要更新但 Antigravity 正在运行时，安装器保持零修改并要求完全退出后重试。
+以后打开任何工作区都不需要重复安装。源码、配置和生成的 Hook 命令相同时直接返回 `updated: false`；
+Python 解释器或端点路径变化时会重新生成 Hook。已有 Companion 需要更新且 Antigravity 或
+Companion Sidecar 正在运行时，安装器保持零修改，待对应实例停止后重试。
 
 卸载命令只删除本插件和对应 Sidecar 配置项：
 
@@ -38,6 +39,10 @@ python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_
 python -m bridge.cli approval inspect --id <id>
 ```
 
+`PreInvocation` 上报后返回空对象，模型开始思考时便会刷新监工状态。事件保留平台提供的
+`invocationNum`、`initialNumSteps`、`executionNum`，以及流式执行器提供的来源、子 agent
+归属和运行状态，便于定位同一会话内的执行进度；这些字段只在输入包含时保存。
+
 ## English
 
 The source is under `antigravity-plugin/`. Register it globally once from the Codex plugin root:
@@ -51,9 +56,10 @@ The installer detects a running Antigravity instance, atomically replaces the fi
 official global directory `~/.gemini/config/plugins/codex-dynamic-bridge`, and merges only the
 `codex-dynamic-bridge/codex-bridge` entry in `~/.gemini/config/config.json`, using the documented
 `default-cli-project` by default. Every workspace then
-shares this Companion. Identical files and configuration return `updated: false`. If an installed
-Companion needs an update while Antigravity is running, the installer makes no changes and asks the
-user to fully exit before retrying.
+shares this Companion. Identical sources, configuration, and generated Hook commands return
+`updated: false`. Changing the Python interpreter or endpoint path regenerates the Hooks. If an
+installed Companion needs an update while Antigravity or its Companion Sidecar is running, stop
+the corresponding instance before retrying; the installer leaves the installed files untouched.
 
 Uninstall removes only this plugin and its Sidecar entry:
 
@@ -69,3 +75,8 @@ decision. A reporting failure never changes this to `allow`, so the Hook cannot 
 permission prompt. Only allowlisted fields such as conversation ID, tool name, and approval state
 are transmitted and persisted; complete command arguments are not. Restart Antigravity once after
 installing or updating the Hook, then Codex can use `event wait-approval` and `approval inspect`.
+
+`PreInvocation` reports the start of a model call and returns an empty object, refreshing supervision
+while the model is thinking. Events retain the supplied `invocationNum`, `initialNumSteps`, and
+`executionNum`, together with stream executor source, subagent relationships, and execution states.
+Fields are recorded only when present in the input.

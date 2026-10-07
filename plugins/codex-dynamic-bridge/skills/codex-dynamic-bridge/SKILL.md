@@ -29,6 +29,8 @@ python -m bridge.cli doctor
 python -m bridge.cli setup status
 ```
 
+`doctor.agy` 返回实际版本及 `flags`，包括 `stream-json`、项目和会话参数。需要检查升级时运行 `setup status --check-update`；该检查只读，发布清单可能比官网更新日志更早更新。已有装载或升级授权时，用 `setup install --refresh-agy --confirm-setup` 重复执行即可；默认保留外部管理的 CLI，指定 `--agy-dir` 才选择另一个安装目录。`pending: true` 表示程序占用且待重试，不表示升级已完成。用户要求清理下载缓存时使用 `setup clean --confirm-clean`，不会删除程序或运行数据。
+
 需要 Sidecar 而 `doctor` 报告不可用时，先只读检查全局注册状态：
 
 ```powershell
@@ -38,7 +40,7 @@ python -m bridge.cli companion status
 当用户明确要求“使用 Codex Dynamic Bridge 完成任务”并授权自动装载完整能力时，执行一次：
 
 ```powershell
-python -m bridge.cli setup ensure --confirm-setup
+python -m bridge.cli setup install --confirm-setup
 ```
 
 该命令在 Windows 从官方 HTTPS manifest 下载 `agy`，校验可信域名与 SHA-512 后安装到 `$CODEX_HOME/tools/agy`，并全局注册 Companion。不得因普通发现、只读或状态检查自动安装。只需要 Companion 时，用户明确授权安装后执行一次性全局注册。未指定项目时使用 Antigravity 官方默认项目 `default-cli-project`；用户明确给出其他项目 ID 时再传 `--project-id`：
@@ -48,7 +50,7 @@ python -m bridge.cli companion install-global --confirm-install
 python -m bridge.cli companion install-global --project-id <project-id> --confirm-install
 ```
 
-安装器会自动检测 Antigravity 是否正在运行，并使用官方全局插件目录；相同文件和配置会直接返回 `updated: false`。已有 Companion 需要更新但 Antigravity 正在运行时，安装器会零修改拒绝并要求完全退出后重试；不要为每个工作区重复安装，也不要对 Electron 进程做热注入。返回 `restartRequired: true` 时提示用户在完成当前工作后重启一次，不要代替用户关闭或重启应用。
+安装器会检查桌面进程和 Sidecar 健康状态，并比较源码、配置及生成的 Hook；相同时返回 `updated: false`。已有 Companion 需要更新且对应实例仍运行时，完成当前任务并停止对应实例后重复安装；不要代替用户关闭实例。返回 `restartRequired: true` 时按结果提示重启一次。
 
 用户明确要求卸载全局 Companion 时执行：
 
@@ -121,6 +123,8 @@ python -m bridge.cli conversation wait --conversation-id <id> --timeout-seconds 
 ```
 
 `new/send/resume/open-new/send-now` 会在发送前持久化回执，成功后返回 `submission.submissionId`。`conversation wait` 与 `event wait` 默认使用该会话最新回执的时间下界；未通过插件投递的任务仍可显式传入 `--after <ISO-8601>`。等待完成仅表示观察到空闲 Stop，不代表验收通过。
+
+需要观察长时间 headless 任务时，在 `doctor` 报告支持后选择 `--backend agy --stream`。原生 `init` 会立即绑定回执和工作区；执行期间可通过另一个只读调用查询 `task submissions`、`task inspect` 和 `activity`，沿用宿主返回的执行句柄等待，不重建任务。详细状态及子 Agent 工作区流程见 [监工生命周期](references/supervision.md)。读取最终结果中的 `diagnostics`：CLI 返回 `SUCCESS` 仍可能有工具未获执行权限，验收必须检查实际命令和结果；需要逐项审批的任务使用桌面路径。
 
 用户已有项目目录时，使用 `agy` 的工作目录和新项目开关，不能只把本地路径当作 `project-id`：
 
@@ -215,7 +219,7 @@ python -m bridge.cli control select-role --id <id> --role combobox --name <name>
 - 不直接编辑 Antigravity 内部 `app_storage.json`、凭据或私有会话存储。
 - `click/fill/press` 使用 `--confirm-control`；会话、模型、项目、设置、产物和计划任务使用各自的专用确认参数。
 - 不读取无关会话、账号凭据或模型内部状态。
-- 缺少 Playwright、`agy` 或 Sidecar 时报告能力缺口；只有用户明确要求插件完成任务并授权完整装载时，才可运行 `setup ensure --confirm-setup`。
+- 缺少 Playwright、`agy` 或 Sidecar 时报告能力缺口；只有用户明确要求插件完成任务并授权完整装载时，才可运行 `setup install --confirm-setup`。
 - 全局 Companion 安装和卸载分别需要 `--confirm-install` 与 `--confirm-uninstall`；不得仅凭 Sidecar 缺失就自动修改 Antigravity 配置。
 - 正在运行的会话收到补充信息时使用 `conversation send --backend auto` 或 `conversation send-now`；不要使用默认 Sidecar `conversation send` 让补充留在 `Queued Messages` 等待会话结束。
 - 自动批准只适用于用户明确授权的当前命令，或已授权监工任务范围内核对过的命令；设置了 Companion 或 `--confirm-approval` 本身不构成批准任意命令的授权。
