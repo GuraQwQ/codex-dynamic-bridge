@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from bridge.state import atomic_write_json
+from bridge.state import atomic_write_json, file_lock
 
 
 SIDECAR_ID = "codex-dynamic-bridge/codex-bridge"
@@ -148,10 +148,6 @@ def hooks_config(destination, endpoint):
     return {"codex-dynamic-bridge-events": events}
 
 
-def write_hooks(destination, endpoint):
-    atomic_write_json(destination / "hooks.json", hooks_config(destination, endpoint))
-
-
 def validate_config(config):
     sidecars = config.get("sidecars")
     if sidecars is None:
@@ -169,11 +165,18 @@ def staged_plugin(destination, endpoint=None):
         raise CompanionError(f"找不到 Companion 源码: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     stage = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
-    shutil.copytree(
-        source,
-        stage,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "data"),
-    )
+    try:
+        shutil.copytree(
+            source,
+            stage,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "data"),
+        )
+        # 暂存时就生成引用最终稳定目录的 Hook，缩短持锁提交阶段。
+        atomic_write_json(stage / "hooks.json", hooks_config(destination, endpoint))
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
     return stage
 
 
@@ -210,7 +213,7 @@ def status(env=None):
     config_path = root / "config.json"
     config = load_config(config_path)
     validate_config(config)
-    entry = config.get("sidecars", {}).get(SIDECAR_ID, {})
+    entry = (config.get("sidecars") or {}).get(SIDECAR_ID) or {}
     return {
         "installed": (destination / "plugin.json").is_file(),
         "enabled": entry.get("enabled") is True,
@@ -224,87 +227,144 @@ def status(env=None):
     }
 
 
+def installation_current(destination, endpoint, project_id, config):
+    entry = (config.get("sidecars") or {}).get(SIDECAR_ID) or {}
+    return (
+        destination.exists()
+        and entry.get("enabled") is True
+        and entry.get("projectId") == project_id
+        and source_matches(destination, endpoint)
+    )
+
+
+def update_sidecar_config(path, project_id, commit_state):
+    # 自有锁仅协调桥接进程；提交前后重读，尽量合并官方应用的并发写入。
+    changed = False
+    for _ in range(3):
+        config = load_config(path)
+        validate_config(config)
+        updated = deepcopy(config)
+        sidecars = updated.get("sidecars") or {}
+        if project_id is None:
+            sidecars.pop(SIDECAR_ID, None)
+        else:
+            sidecars[SIDECAR_ID] = {
+                **(sidecars.get(SIDECAR_ID) or {}),
+                "enabled": True,
+                "projectId": project_id,
+            }
+            updated["sidecars"] = sidecars
+        if updated == config:
+            return changed
+        if load_config(path) != config:
+            continue
+        try:
+            atomic_write_json(path, updated)
+        except BaseException:
+            try:
+                if load_config(path) == updated:
+                    commit_state["written"] = True
+            except Exception:
+                pass
+            raise
+        commit_state["written"] = True
+        changed = True
+        if load_config(path) == updated:
+            return changed
+    raise CompanionError("Antigravity 配置持续被其他进程修改，已保留最新配置；请重试")
+
+
 def install_global(project_id, env=None):
-    if not project_id or not project_id.strip():
+    if not isinstance(project_id, str) or not project_id.strip():
         raise CompanionError("全局 Sidecar 必须配置默认 project ID")
+    project_id = project_id.strip()
     root = config_root(env)
     config_path = root / "config.json"
-    config = load_config(config_path)
-    validate_config(config)
-
     destination = destination_plugin(env)
-    validate_owned_destination(destination)
-    updated = deepcopy(config)
-    sidecars = updated.setdefault("sidecars", {})
-    existing = sidecars.get(SIDECAR_ID, {})
-    sidecars[SIDECAR_ID] = {
-        **existing,
-        "enabled": True,
-        "projectId": project_id.strip(),
-    }
+    endpoint = endpoint_file(env)
+    with file_lock(config_path):
+        config = load_config(config_path)
+        validate_config(config)
+        validate_owned_destination(destination)
+        unchanged = installation_current(destination, endpoint, project_id, config)
 
-    if destination.exists() and source_matches(destination, endpoint_file(env)) and updated == config:
+    if unchanged:
         result = status(env)
         result.update({"updated": False, "restartRequired": False})
         return result
     if destination.exists() and (desktop_running(env) or endpoint_ready(env)):
         raise CompanionError("Antigravity 或 Companion Sidecar 正在运行且需要更新；请停止对应实例后重试安装")
 
-    stage = staged_plugin(destination, endpoint_file(env))
+    stage = staged_plugin(destination, endpoint)
     backup = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.backup"
-    had_destination = destination.exists()
     moved_destination = False
     installed_stage = False
+    commit_state = {"written": False}
     try:
-        if had_destination:
-            os.replace(destination, backup)
-            moved_destination = True
-        os.replace(stage, destination)
-        installed_stage = True
-        # Hook 命令必须引用最终稳定目录；暂存目录会在事务结束时删除。
-        write_hooks(destination, endpoint_file(env))
-        atomic_write_json(config_path, updated)
-    except Exception:
+        running = desktop_running(env) or endpoint_ready(env)
+        with file_lock(config_path):
+            config = load_config(config_path)
+            validate_config(config)
+            validate_owned_destination(destination)
+            unchanged = installation_current(destination, endpoint, project_id, config)
+            if not unchanged:
+                if destination.exists() and running:
+                    raise CompanionError("Antigravity 或 Companion Sidecar 正在运行且需要更新；请停止对应实例后重试安装")
+                try:
+                    if destination.exists():
+                        os.replace(destination, backup)
+                        moved_destination = True
+                    os.replace(stage, destination)
+                    installed_stage = True
+                    update_sidecar_config(config_path, project_id, commit_state)
+                except BaseException:
+                    if commit_state["written"]:
+                        if backup.exists():
+                            shutil.rmtree(backup, ignore_errors=True)
+                    else:
+                        if installed_stage and destination.exists():
+                            shutil.rmtree(destination)
+                        if moved_destination and backup.exists():
+                            os.replace(backup, destination)
+                    raise
+    finally:
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
-        if installed_stage and destination.exists():
-            shutil.rmtree(destination)
-        if moved_destination and backup.exists():
-            os.replace(backup, destination)
-        raise
-    if had_destination:
+    if moved_destination:
         shutil.rmtree(backup, ignore_errors=True)
 
     result = status(env)
-    result["updated"] = True
-    result["restartRequired"] = result["antigravityRunning"]
+    result["updated"] = not unchanged
+    result["restartRequired"] = not unchanged and result["antigravityRunning"]
     return result
 
 
 def uninstall_global(env=None):
     root = config_root(env)
     destination = destination_plugin(env)
-    validate_owned_destination(destination)
     config_path = root / "config.json"
-    config = load_config(config_path)
-    validate_config(config)
-    updated = deepcopy(config)
-    sidecars = updated.get("sidecars")
-    configured = isinstance(sidecars, dict) and SIDECAR_ID in sidecars
-    if isinstance(sidecars, dict):
-        sidecars.pop(SIDECAR_ID, None)
-    installed = destination.exists()
     backup = None
-    try:
-        if installed:
-            backup = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.backup"
-            os.replace(destination, backup)
-        if configured:
-            atomic_write_json(config_path, updated)
-    except Exception:
-        if backup and backup.exists():
-            os.replace(backup, destination)
-        raise
+    commit_state = {"written": False}
+    with file_lock(config_path):
+        validate_owned_destination(destination)
+        config = load_config(config_path)
+        validate_config(config)
+        installed = destination.exists()
+        configured = SIDECAR_ID in (config.get("sidecars") or {})
+        moved_destination = False
+        try:
+            if installed:
+                backup = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.backup"
+                os.replace(destination, backup)
+                moved_destination = True
+            configured = update_sidecar_config(config_path, None, commit_state) or configured
+        except BaseException:
+            if moved_destination and backup.exists():
+                if commit_state["written"]:
+                    shutil.rmtree(backup, ignore_errors=True)
+                else:
+                    os.replace(backup, destination)
+            raise
     if backup:
         shutil.rmtree(backup, ignore_errors=True)
 

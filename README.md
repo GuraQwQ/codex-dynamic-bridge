@@ -486,7 +486,6 @@ python -m unittest bridge.self_test bridge.supervision_test bridge.stream_test b
 |   |   |-- state.py
 |   |   `-- self_test.py
 |   |-- companion/
-|   |   |-- install.py
 |   |   `-- antigravity-plugin/
 |   |-- skills/codex-dynamic-bridge/SKILL.md
 |   `-- README.md
@@ -969,7 +968,6 @@ Repository layout:
 |   |   |-- state.py
 |   |   `-- self_test.py
 |   |-- companion/
-|   |   |-- install.py
 |   |   `-- antigravity-plugin/
 |   |-- skills/codex-dynamic-bridge/SKILL.md
 |   `-- README.md
