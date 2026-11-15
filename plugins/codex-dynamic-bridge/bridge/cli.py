@@ -1,8 +1,10 @@
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
@@ -12,6 +14,8 @@ from urllib.request import urlopen
 from bridge.runtime import (
     AgyClient,
     RuntimeBridgeError,
+    RuntimeWaitTimeout,
+    RuntimeUnavailable,
     SidecarClient,
     find_agy,
     runtime_summary,
@@ -25,9 +29,12 @@ from bridge.companion import (
     uninstall_global as uninstall_companion_global,
 )
 from bridge.state import (
+    ApprovalStore,
     EventStore,
     StateError,
     TaskStore,
+    file_lock,
+    pending_approval,
     artifact_root_for_conversation,
     list_artifacts,
     read_artifact,
@@ -498,6 +505,7 @@ def conversation_command(args):
     event_store = EventStore()
     task_store = TaskStore()
     if args.conversation_action == "wait":
+        deadline = time.monotonic() + args.timeout_seconds
         receipt = SubmissionStore().latest(args.conversation_id)
         after = (
             format_timestamp(parse_timestamp(args.after)) if args.after
@@ -506,21 +514,22 @@ def conversation_command(args):
         if args.backend in {"auto", "sidecar"}:
             try:
                 sidecar = SidecarClient()
-                sidecar.health()
                 return print_json(
                     sidecar.wait(
                         args.conversation_id,
-                        timeout_seconds=args.timeout_seconds,
+                        timeout_seconds=max(0, deadline - time.monotonic()),
                         after=after,
                     )
                 )
-            except RuntimeBridgeError:
+            except RuntimeWaitTimeout:
+                raise
+            except RuntimeUnavailable:
                 if args.backend == "sidecar":
                     raise
         return print_json(
             event_store.wait(
                 args.conversation_id,
-                timeout_seconds=args.timeout_seconds,
+                timeout_seconds=max(0, deadline - time.monotonic()),
                 after=after,
             )
         )
@@ -533,7 +542,14 @@ def conversation_command(args):
     stream = getattr(args, "stream", False)
     if stream and args.backend != "agy":
         raise BridgeError("流式任务请显式选择 --backend agy --stream")
-    if args.conversation_action in {"send", "resume"} and args.backend == "auto":
+    require_agy = bool(
+        args.model or args.effort or args.agent
+        or getattr(args, "project_id", None)
+        or getattr(args, "project_path", None)
+        or getattr(args, "new_project", False)
+        or args.conversation_action == "resume"
+    )
+    if args.conversation_action == "send" and args.backend == "auto" and not require_agy:
         try:
             select_sessions(discover_sessions(), args.conversation_id)
         except BridgeError:
@@ -545,15 +561,6 @@ def conversation_command(args):
             args.prompt = prompt
             args.conversation_action = "send-now"
             return desktop_conversation_command(args)
-    require_agy = bool(
-        args.model
-        or args.effort
-        or args.agent
-        or getattr(args, "project_id", None)
-        or getattr(args, "project_path", None)
-        or getattr(args, "new_project", False)
-        or args.conversation_action == "resume"
-    )
     backend_name = args.backend
     if (
         args.conversation_action in {"send", "resume"}
@@ -624,6 +631,7 @@ def event_command(args):
     if args.event_action == "list":
         return print_json(store.list(args.conversation_id, limit=args.limit))
     if args.event_action == "wait-approval":
+        deadline = time.monotonic() + args.timeout_seconds
         after = format_timestamp(parse_timestamp(args.after)) if args.after else None
         if args.backend in {"auto", "sidecar"}:
             sidecar = SidecarClient()
@@ -631,12 +639,14 @@ def event_command(args):
                 event = sidecar.wait_for_event(
                     args.conversation_id,
                     "PreToolUse",
-                    timeout_seconds=args.timeout_seconds,
+                    timeout_seconds=max(0, deadline - time.monotonic()),
                     tool_name=args.tool_name,
                     approval_state="requested",
                     after=after,
                 )
-            except RuntimeBridgeError:
+            except RuntimeWaitTimeout:
+                raise
+            except RuntimeUnavailable:
                 if args.backend == "sidecar":
                     raise
             else:
@@ -646,7 +656,7 @@ def event_command(args):
         return print_json(
             store.wait_approval(
                 args.conversation_id,
-                timeout_seconds=args.timeout_seconds,
+                timeout_seconds=max(0, deadline - time.monotonic()),
                 tool_name=args.tool_name,
                 after=after,
             )
@@ -665,23 +675,53 @@ def event_command(args):
 
 def approval_command(args):
     if args.approval_action == "inspect":
-        return run_desktop_workflow(args, "approval-inspect")
+        store = ApprovalStore()
+        lock_path = store.lock_path(args.id)
+        with file_lock(lock_path):
+            result = run_desktop_workflow(args, "approval-inspect", emit=False)
+            snapshot = result.get("detail", {}).get("approval", {})
+            if snapshot.get("open"):
+                try:
+                    event = pending_approval(SidecarClient().list_all_events(args.id))
+                except RuntimeBridgeError as exc:
+                    event = None
+                    result["approvalEventError"] = str(exc)
+                if event:
+                    result["approvalResponse"] = {
+                        "requestId": store.request_id(event),
+                        "status": store.inspect(event, snapshot["fingerprint"]),
+                    }
+        return print_json(result)
     if not args.confirm_approval:
         raise BridgeError("响应命令审批会修改 Antigravity 状态；请传入 --confirm-approval")
 
-    observed_at = format_timestamp(parse_timestamp(args.event_observed_at))
-    events = SidecarClient().list_events(args.id)
-    matching = [
-        event
-        for event in events
-        if event.get("kind") == "PreToolUse"
-        and event.get("approvalState") == "requested"
-        and event.get("toolName") == args.tool_name
-        and event.get("observedAt") == observed_at
-    ]
-    if len(matching) != 1:
-        raise BridgeError("找不到与本次响应精确对应的唯一审批事件，拒绝点击")
-    return run_desktop_workflow(args, "approval-respond")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.dialog_fingerprint):
+        raise BridgeError("请使用 approval inspect 返回的完整 fingerprint")
+    observed_at = parse_timestamp(args.event_observed_at)
+    client = SidecarClient()
+    store = ApprovalStore()
+    lock_path = store.lock_path(args.id)
+    with file_lock(lock_path):
+        events = client.list_all_events(args.id)
+        event = pending_approval(events, args.tool_name)
+        if not event or parse_timestamp(event["observedAt"]) != observed_at:
+            raise BridgeError("指定审批已结束或已被后续请求替代；请重新检查当前审批")
+        request_id, claimed = store.claim(event, args.dialog_fingerprint)
+        if not claimed:
+            return print_json({"requestId": request_id, "status": "responded", "alreadyResponded": True})
+
+        args.approval_click_started = False
+        args.before_approval_click = lambda: store.finish(request_id, "responding")
+        try:
+            result = run_desktop_workflow(args, "approval-respond", emit=False)
+        except BaseException:
+            store.finish(request_id, "uncertain" if args.approval_click_started else "retryable")
+            raise
+        finally:
+            del args.before_approval_click
+        store.finish(request_id, "responded")
+    result["approvalResponse"] = {"requestId": request_id, "status": "responded"}
+    return print_json(result)
 
 
 def review_command(args):
@@ -790,7 +830,7 @@ def artifact_command(args):
     return print_json({"root": str(root), "path": args.path, "content": content})
 
 
-def run_desktop_workflow(args, workflow_action, allow_shell=False):
+def run_desktop_workflow(args, workflow_action, allow_shell=False, emit=True):
     from bridge.control import ControlError, execute_control
 
     args.control_action = "workflow"
@@ -821,7 +861,7 @@ def run_desktop_workflow(args, workflow_action, allow_shell=False):
     if page:
         result["sourceDevtoolsId"] = page["devtoolsId"]
         result["bootstrappedFromShell"] = page["kind"] == "shell"
-    return print_json(result)
+    return print_json(result) if emit else result
 
 
 def run_new_conversation_workflow(args):
@@ -1278,6 +1318,8 @@ def build_parser():
     approval_respond_parser.add_argument("--option-name", required=True)
     approval_respond_parser.add_argument("--tool-name", required=True)
     approval_respond_parser.add_argument("--event-observed-at", required=True)
+    approval_respond_parser.add_argument("--dialog-fingerprint", required=True,
+                                         help="approval inspect 返回的当前对话框指纹")
     approval_respond_parser.add_argument("--confirm-approval", action="store_true")
     approval_respond_parser.set_defaults(func=approval_command)
 

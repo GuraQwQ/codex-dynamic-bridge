@@ -197,12 +197,14 @@ def sync_events(client, store, tasks, conversation_id=None):
     imported_count = 0
     updated = {}
     recovered = False
+    corrupt_lines = set()
     while True:
         before = read_checkpoint(checkpoint)
         recovered = recovered or before.get("recovered", False)
         page = client.event_page(
             conversation_id, limit=1000, after=before["cursor"], stream_id=before["streamId"]
         )
+        corrupt_lines.update(page.get("corruptLines", []))
         if not page.get("streamId"):
             raise StateError("增量同步需要新版 Companion；请更新后重试")
         if page["hasMore"] and page["nextCursor"] <= (0 if page.get("reset") else before["cursor"]):
@@ -218,4 +220,5 @@ def sync_events(client, store, tasks, conversation_id=None):
             atomic_write_json(checkpoint, current)
         if not page["hasMore"]:
             return {"imported": imported_count, "tasks": list(updated.values()),
-                    "checkpoint": current, "checkpointRecovered": recovered}
+                    "checkpoint": current, "checkpointRecovered": recovered,
+                    "corruptLines": sorted(corrupt_lines), "incompleteLine": page.get("incompleteLine")}

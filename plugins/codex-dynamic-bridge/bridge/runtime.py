@@ -8,16 +8,25 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from bridge.state import after_event, completed_event
+from bridge.state import after_event, completed_event, pending_approval
 
 
 class RuntimeBridgeError(RuntimeError):
     """外部 Antigravity 运行时不可用或返回无效结果。"""
+
+
+class RuntimeWaitTimeout(RuntimeBridgeError):
+    """事件等待已耗尽总预算，不能作为断联重新等待。"""
+
+
+class RuntimeUnavailable(RuntimeBridgeError):
+    """Sidecar 未启动或传输连接不可用，允许改读本地状态。"""
 
 
 def find_agy(env=None):
@@ -313,7 +322,7 @@ class SidecarClient:
 
     def configuration(self):
         if not self.endpoint_file.is_file():
-            raise RuntimeBridgeError(f"未找到 Sidecar 端点文件: {self.endpoint_file}")
+            raise RuntimeUnavailable(f"未找到 Sidecar 端点文件: {self.endpoint_file}")
         try:
             value = json.loads(self.endpoint_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -339,15 +348,17 @@ class SidecarClient:
         try:
             with self.opener(request, timeout=timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
-        except (OSError, HTTPError, URLError) as exc:
-            raise RuntimeBridgeError(f"Sidecar 请求失败: {exc}") from exc
+        except HTTPError as exc:
+            raise RuntimeBridgeError(f"Sidecar 返回 HTTP {exc.code}: {exc.reason}") from exc
+        except (OSError, URLError) as exc:
+            raise RuntimeUnavailable(f"Sidecar 连接失败: {exc}") from exc
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeBridgeError("Sidecar 未返回有效 JSON") from exc
 
-    def health(self):
-        return self.request("GET", "/v1/health")
+    def health(self, timeout_seconds=30):
+        return self.request("GET", "/v1/health", timeout_seconds=timeout_seconds)
 
     def new_conversation(self, prompt):
         return self.request("POST", "/v1/conversations", {"prompt": prompt})
@@ -359,7 +370,7 @@ class SidecarClient:
             {"prompt": prompt},
         )
 
-    def event_page(self, conversation_id=None, limit=100, after=None, stream_id=None):
+    def event_page(self, conversation_id=None, limit=100, after=None, stream_id=None, timeout_seconds=30):
         if not 1 <= limit <= 1000 or (after is not None and after < 0):
             raise RuntimeBridgeError("limit 必须为 1..1000，after 必须为非负整数")
         query = {"limit": limit}
@@ -371,7 +382,7 @@ class SidecarClient:
             if not all(character.isalnum() or character == "-" for character in conversation_id):
                 raise RuntimeBridgeError("conversation ID 只能包含字母、数字和连字符")
             query["conversation_id"] = conversation_id
-        page = self.request("GET", f"/v1/events?{urlencode(query)}")
+        page = self.request("GET", f"/v1/events?{urlencode(query)}", timeout_seconds=timeout_seconds)
         if (
             not isinstance(page, dict)
             or not isinstance(page.get("events"), list)
@@ -379,16 +390,36 @@ class SidecarClient:
             or not isinstance(page.get("hasMore"), bool)
         ):
             raise RuntimeBridgeError("Sidecar 事件分页响应无效")
+        if page.get("corruptLines") or page.get("incompleteLine"):
+            warnings.warn(
+                f"Sidecar 事件日志包含损坏行 {page.get('corruptLines', [])}，"
+                f"未完成行 {page.get('incompleteLine')}；已保留原始数据并继续读取有效事件",
+                RuntimeWarning,
+            )
         return page
 
     def list_events(self, conversation_id=None, limit=100):
         return self.event_page(conversation_id, limit=limit)["events"]
 
-    def list_all_events(self, conversation_id=None, page_size=1000):
+    def list_all_events(self, conversation_id=None, page_size=1000, deadline=None):
         events = []
         cursor = 0
+        stream_id = None
         while True:
-            page = self.event_page(conversation_id, limit=page_size, after=cursor)
+            remaining = 30 if deadline is None else deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeWaitTimeout("等待 Sidecar 事件超时")
+            try:
+                page = self.event_page(conversation_id, limit=page_size, after=cursor,
+                                       stream_id=stream_id, timeout_seconds=min(30, remaining))
+            except RuntimeUnavailable as exc:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RuntimeWaitTimeout("等待 Sidecar 事件超时") from exc
+                raise
+            if page.get("reset"):
+                events = []
+                cursor = 0
+            stream_id = page.get("streamId")
             events.extend(page["events"])
             if not page.get("hasMore"):
                 return events
@@ -397,15 +428,41 @@ class SidecarClient:
                 raise RuntimeBridgeError("Sidecar 事件游标未向前推进")
             cursor = next_cursor
 
-    def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.5, after=None):
+    def _wait(self, conversation_id, predicate, timeout_seconds, poll_seconds):
         deadline = time.monotonic() + timeout_seconds
+        events = []
+        cursor = 0
+        stream_id = None
         while True:
-            event = completed_event(self.list_events(conversation_id), after)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeWaitTimeout(f"等待 Sidecar 事件超时: {conversation_id}")
+            try:
+                page = self.event_page(conversation_id, limit=1000, after=cursor,
+                                       stream_id=stream_id, timeout_seconds=min(30, remaining))
+            except RuntimeUnavailable as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeWaitTimeout(f"等待 Sidecar 事件超时: {conversation_id}") from exc
+                raise
+            if page.get("reset"):
+                events = []
+                cursor = 0
+            events.extend(page["events"])
+            next_cursor = page["nextCursor"]
+            if page["hasMore"] and next_cursor <= cursor:
+                raise RuntimeBridgeError("Sidecar 事件游标未向前推进")
+            cursor = next_cursor
+            stream_id = page.get("streamId")
+            if page["hasMore"]:
+                continue
+            event = predicate(events)
             if event:
                 return event
-            if time.monotonic() >= deadline:
-                raise RuntimeBridgeError(f"等待 Sidecar 会话完成超时: {conversation_id}")
-            time.sleep(poll_seconds)
+            time.sleep(min(poll_seconds, max(0, deadline - time.monotonic())))
+
+    def wait(self, conversation_id, timeout_seconds=30, poll_seconds=0.5, after=None):
+        return self._wait(conversation_id, lambda events: completed_event(events, after),
+                          timeout_seconds, poll_seconds)
 
     def wait_for_event(
         self,
@@ -417,9 +474,10 @@ class SidecarClient:
         approval_state=None,
         after=None,
     ):
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            for event in reversed(self.list_events(conversation_id)):
+        def matching(events):
+            if kind == "PreToolUse" and approval_state == "requested":
+                return pending_approval(events, tool_name, after)
+            for event in reversed(events):
                 if event.get("kind") != kind:
                     continue
                 if tool_name and event.get("toolName") != tool_name:
@@ -429,11 +487,9 @@ class SidecarClient:
                 if not after_event(event, after):
                     continue
                 return event
-            if time.monotonic() >= deadline:
-                raise RuntimeBridgeError(
-                    f"等待 Sidecar 事件超时: {conversation_id} / {kind}"
-                )
-            time.sleep(poll_seconds)
+            return None
+
+        return self._wait(conversation_id, matching, timeout_seconds, poll_seconds)
 
     def list_schedules(self):
         return self.request("GET", "/v1/schedules").get("schedules", [])

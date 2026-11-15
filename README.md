@@ -273,14 +273,16 @@ python -m bridge.cli event list --conversation-id <id>
 python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_command --timeout-seconds 300
 python -m bridge.cli approval inspect --id <id>
 # 仅在用户明确授权了当前可见命令后，使用 wait-approval 返回的工具名和 observedAt：
-python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
+python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --dialog-fingerprint <fingerprint> --confirm-approval
 # 用户明确要求拒绝时，先 inspect，再绑定精确 deny 选项和提交按钮：
-python -m bridge.cli approval respond --id <id> --decision deny --option-name <exact-deny-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
+python -m bridge.cli approval respond --id <id> --decision deny --option-name <exact-deny-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --dialog-fingerprint <fingerprint> --confirm-approval
 Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 Get-Content -Raw .\prompt.txt | python -m bridge.cli schedule create --prompt-stdin --interval-seconds 3600 --confirm-schedule
 python -m bridge.cli schedule list
 python -m bridge.cli schedule remove --schedule-id <id> --confirm-schedule
 ```
+
+`approval inspect` 返回的 `detail.approval.fingerprint` 绑定当前审批框；将该值原样传给 `--dialog-fingerprint`，审批框变化后重新检查。
 
 ### 一次性启用全局 Companion Sidecar
 
@@ -755,14 +757,16 @@ python -m bridge.cli event list --conversation-id <id>
 python -m bridge.cli event wait-approval --conversation-id <id> --tool-name run_command --timeout-seconds 300
 python -m bridge.cli approval inspect --id <id>
 # Only after the user authorizes the visible command, bind the response to the returned tool and observedAt:
-python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
+python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --dialog-fingerprint <fingerprint> --confirm-approval
 # When the user explicitly requests denial, inspect first and bind the exact deny option:
-python -m bridge.cli approval respond --id <id> --decision deny --option-name <exact-deny-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --confirm-approval
+python -m bridge.cli approval respond --id <id> --decision deny --option-name <exact-deny-option-text> --button-name <exact-submit-button-name> --tool-name run_command --event-observed-at <observedAt> --dialog-fingerprint <fingerprint> --confirm-approval
 Get-Content -Raw .\supplement.txt | python -m bridge.cli conversation send-now --id <id> --prompt-stdin --confirm-send
 Get-Content -Raw .\prompt.txt | python -m bridge.cli schedule create --prompt-stdin --interval-seconds 3600 --confirm-schedule
 python -m bridge.cli schedule list
 python -m bridge.cli schedule remove --schedule-id <id> --confirm-schedule
 ```
+
+The `detail.approval.fingerprint` returned by `approval inspect` binds the response to the current approval dialog. Pass it unchanged with `--dialog-fingerprint`, and inspect again if the dialog changes.
 
 ### Enable the global Companion Sidecar once
 

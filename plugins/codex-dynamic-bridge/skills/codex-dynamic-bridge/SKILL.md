@@ -189,13 +189,15 @@ python -m bridge.cli task inspect --conversation-id <id>
 
 `event sync` 按 Sidecar 端点文件和会话过滤范围保存进度，逐页提交；重复执行只读取增量，日志替换或截短后重读并去重。此能力需要 `doctor.sidecar.eventStreamCursor: true`；更新 Companion 前仍可使用 CLI/CDP 基础路径。`task inspect` 只读本地快照，需要新事件时先同步。事件与任务状态只保存白名单字段；不要把会话正文、Hook 原始 payload、令牌或凭据写入链接和任务账本。
 
-投递长任务后主动等待 `PreToolUse` 审批事件，不依赖偶尔读取整页。事件到达后先运行 `approval inspect`，它可返回当前可见命令、选项与提交按钮，但不会持久化命令正文。用户明确授权当前命令，或明确授权监工在限定任务范围内自主判断并审批后，才能把事件返回的 `toolName`、`observedAt` 与检查到的精确选项/按钮绑定后响应：
+投递长任务后主动等待 `PreToolUse` 审批事件，不依赖偶尔读取整页。事件到达后先运行 `approval inspect`，它返回当前可见命令、选项、提交按钮及 `detail.approval.fingerprint`，不会持久化命令正文。用户明确授权当前命令，或明确授权监工在限定任务范围内自主判断并审批后，把事件返回的 `toolName`、`observedAt` 与当前指纹、精确选项和按钮绑定后响应：
 
 ```powershell
-python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name <toolName> --event-observed-at <observedAt> --confirm-approval
+python -m bridge.cli approval respond --id <id> --decision allow --option-name <exact-option-text> --button-name <exact-submit-button-name> --tool-name <toolName> --event-observed-at <observedAt> --dialog-fingerprint <fingerprint> --confirm-approval
 ```
 
 未授权时只通知用户。`PreToolUse` Hook 返回 `ask`，绝不返回 `allow` 绕过权限；只保存工具名和审批状态，不保存完整命令参数。
+
+审批响应已完成时重复调用返回已有状态；提交后中断会保留待核对记录，不能自动重放。重新运行 `approval inspect`，仅当同一请求仍待审批且当前指纹相同，才会标记为可重试；提交前指纹不匹配或定位失败可重新检查后重试。
 
 Companion 不可用时，可继续用 CDP 读取页面、Review diff 和 `approval inspect` 检查当前审批框，但不能等待不存在的 Hook 来源；`approval respond` 的事件绑定依赖 Companion，对 Sol 和 Astra 相同。此时报告待审批状态及能力缺口，不声称已完成自主审批，也不伪造事件或自动安装组件。
 

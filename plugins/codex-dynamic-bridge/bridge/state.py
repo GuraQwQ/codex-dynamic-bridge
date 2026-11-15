@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -74,6 +75,26 @@ def event_time(value):
 
 def after_event(event, after):
     return not after or event_time(event["observedAt"]) > event_time(after)
+
+
+def pending_approval(events, tool_name=None, after=None):
+    current = None
+    for event in sorted(events, key=lambda item: event_time(item["observedAt"])):
+        kind = event.get("kind")
+        if kind == "PreToolUse":
+            current = event if event.get("approvalState") == "requested" else None
+        elif kind in {"Stop", "PreInvocation", "PostInvocation"}:
+            current = None
+        elif kind == "CliResult" and event.get("cliStatus") in {"CANCELED", "INTERRUPTED", "ERROR", "INVALID"}:
+            current = None
+        elif kind == "PostToolUse" and current:
+            fields = ("toolName", "invocationNum", "executionNum", "stepIdx")
+            if all(event.get(key) is None or current.get(key) is None
+                   or event[key] == current[key] for key in fields):
+                current = None
+    if current and (not tool_name or current.get("toolName") == tool_name) and after_event(current, after):
+        return current
+    return None
 
 
 def completed_event(events, after=None):
@@ -231,6 +252,71 @@ def atomic_write_json(path, value):
             temporary_path.unlink()
 
 
+class ApprovalStore:
+    def __init__(self, path=None):
+        self.path = Path(path or default_data_dir() / "approvals.json")
+
+    @staticmethod
+    def request_id(event):
+        fields = ("conversationId", "toolName", "invocationNum", "executionNum", "stepIdx")
+        identity = {key: event.get(key) for key in fields}
+        identity["observedAt"] = event_time(event["observedAt"]).astimezone(timezone.utc).isoformat()
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def lock_path(self, conversation_id):
+        key = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()
+        return self.path.parent / "approval-locks" / key
+
+    def _load(self):
+        if not self.path.exists():
+            return {}
+        try:
+            records = json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise StateError("审批响应记录不是有效 JSON，已保留原文件") from exc
+        if not isinstance(records, dict):
+            raise StateError("审批响应记录必须是 JSON 对象")
+        return records
+
+    def inspect(self, event, fingerprint):
+        request_id = self.request_id(event)
+        with file_lock(self.path):
+            records = self._load()
+            previous = records.get(request_id)
+            if previous and previous["status"] in {"responding", "uncertain"}:
+                if previous["fingerprint"] == fingerprint:
+                    previous.update(status="retryable", updatedAt=utc_now())
+                    atomic_write_json(self.path, records)
+                    return "retryable"
+            return previous["status"] if previous else "unanswered"
+
+    def claim(self, event, fingerprint):
+        request_id = self.request_id(event)
+        with file_lock(self.path):
+            records = self._load()
+            previous = records.get(request_id)
+            if previous and previous["status"] == "responded":
+                return request_id, False
+            if previous and previous["status"] in {"responding", "uncertain"}:
+                raise StateError("上次审批提交结果尚未确认；请检查当前对话框及后续工具事件，不能重复提交")
+            records[request_id] = {
+                "conversationId": event["conversationId"],
+                "toolName": event["toolName"],
+                "observedAt": event["observedAt"],
+                "fingerprint": fingerprint,
+                "status": "preparing",
+                "updatedAt": utc_now(),
+            }
+            atomic_write_json(self.path, records)
+        return request_id, True
+
+    def finish(self, request_id, status):
+        with file_lock(self.path):
+            records = self._load()
+            records[request_id].update(status=status, updatedAt=utc_now())
+            atomic_write_json(self.path, records)
+
+
 class EventStore:
     def __init__(self, path=None):
         self.path = Path(path or default_data_dir() / "events.jsonl")
@@ -256,6 +342,10 @@ class EventStore:
         return event
 
     def list(self, conversation_id=None, limit=100):
+        with file_lock(self.path):
+            return self._list(conversation_id, limit)
+
+    def _list(self, conversation_id=None, limit=100):
         if not self.path.exists():
             return []
         events = []
@@ -283,7 +373,7 @@ class EventStore:
             return self._import_events(events)
 
     def _import_events(self, events):
-        records = self.list(limit=None)
+        records = self._list(limit=None)
         existing = {
             json.dumps(event, ensure_ascii=False, sort_keys=True)
             for event in records
@@ -328,7 +418,7 @@ class EventStore:
                 return event
             if time.monotonic() >= deadline:
                 raise StateError(f"等待会话完成超时: {conversation_id}")
-            time.sleep(poll_seconds)
+            time.sleep(min(poll_seconds, max(0, deadline - time.monotonic())))
 
     def wait_approval(
         self,
@@ -340,20 +430,13 @@ class EventStore:
     ):
         deadline = time.monotonic() + timeout_seconds
         while True:
-            events = self.list(conversation_id=conversation_id, limit=1000)
-            for event in reversed(events):
-                if event.get("kind") != "PreToolUse":
-                    continue
-                if event.get("approvalState") != "requested":
-                    continue
-                if tool_name and event.get("toolName") != tool_name:
-                    continue
-                if not after_event(event, after):
-                    continue
+            events = self.list(conversation_id=conversation_id, limit=None)
+            event = pending_approval(events, tool_name, after)
+            if event:
                 return event
             if time.monotonic() >= deadline:
                 raise StateError(f"等待会话审批请求超时: {conversation_id}")
-            time.sleep(poll_seconds)
+            time.sleep(min(poll_seconds, max(0, deadline - time.monotonic())))
 
     def summary(self, conversation_id):
         all_events = self.list(limit=None)

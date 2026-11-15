@@ -1,3 +1,7 @@
+import hashlib
+import json
+import re
+import time
 from urllib.parse import parse_qs, urlparse
 
 
@@ -346,9 +350,23 @@ def open_desktop_project(page, timeout_ms, settle_ms, project_id=None, name=None
     return project
 
 
+def approval_fingerprint(snapshot):
+    identity = {
+        "text": snapshot.get("text", "").replace("\r\n", "\n").strip(),
+        "buttons": snapshot.get("buttons", []),
+        "options": [
+            {key: option.get(key) for key in ("name", "decision")}
+            for option in snapshot.get("options", [])
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def approval_dialog_snapshot(page):
     """只读取当前权限对话框；内容不写入事件或任务账本。"""
-    return page.evaluate(
+    snapshot = page.evaluate(
         r"""() => {
             const markers = [
                 '是否允许运行此命令',
@@ -412,16 +430,20 @@ def approval_dialog_snapshot(page):
                 .filter(option => option.name);
             return {
                 open: true,
-                text: rawText.slice(0, 4000),
+                text: rawText,
                 textLength: rawText.length,
                 buttons,
                 options
             };
         }"""
     )
+    if snapshot.get("open"):
+        snapshot["fingerprint"] = approval_fingerprint(snapshot)
+        snapshot["text"] = snapshot["text"][:4000]
+    return snapshot
 
 
-def queued_send_now_target(page, prompt):
+def queued_send_now_target(page, prompt, allow_missing=False):
     buttons = page.get_by_role("button", name="Send Now", exact=True)
     matches = []
     for index in range(buttons.count()):
@@ -440,11 +462,21 @@ def queued_send_now_target(page, prompt):
             prompt,
         ):
             matches.append(button)
+    if not matches and allow_missing:
+        return None
     if len(matches) != 1:
         raise ControlError(
             f"无法把补充内容关联到唯一 Send Now 按钮，实际候选 {len(matches)} 个"
         )
     return matches[0]
+
+
+def user_message_count(page, prompt, timeout_ms):
+    messages = page.locator('[role="article"][aria-label="User message"]')
+    return sum(
+        messages.nth(index).inner_text(timeout=timeout_ms).strip() == prompt.strip()
+        for index in range(messages.count())
+    )
 
 
 def review_tab_target(page, timeout_ms):
@@ -480,27 +512,42 @@ def review_region_target(page):
     return matches[0]
 
 
-def open_model_menu(page, timeout_ms, trigger_name=None):
+def model_trigger(page, timeout_ms, trigger_name=None):
     if trigger_name:
-        target, _, _ = resolve_role_target(
-            page, "button", trigger_name, exact=False, nth=None
-        )
-        target.click(timeout=timeout_ms)
-        return trigger_name
+        targets = page.get_by_role("button", name=trigger_name, exact=False)
+        if targets.count() == 1:
+            target = targets.nth(0)
+            return target, " ".join(target.inner_text(timeout=timeout_ms).split())
+        if targets.count() > 1:
+            raise ControlError("模型选择器名称匹配了多个按钮")
     buttons = page.locator("button")
     matches = []
+    semantic_matches = []
     for index in range(buttons.count()):
         button = buttons.nth(index)
         try:
-            text = button.inner_text(timeout=timeout_ms).strip()
+            if not button.is_visible():
+                continue
+            text = " ".join(button.inner_text(timeout=timeout_ms).split())
         except Exception:
             continue
-        if text.startswith(("Gemini ", "Claude ", "GPT-OSS", "GPT ")):
+        label = " ".join(filter(None, (
+            button.get_attribute("aria-label"), button.get_attribute("title")
+        )))
+        if re.search(r"\bmodel\b|模型", label, re.IGNORECASE) and button.get_attribute("aria-haspopup"):
+            semantic_matches.append((button, text))
+        if re.match(r"^(?:Gemini|Claude|GPT)(?:[\s-]|$)", text):
             matches.append((button, text))
+    matches = semantic_matches or matches
     if len(matches) != 1:
         raise ControlError(f"无法唯一识别模型选择器，实际候选 {len(matches)} 个")
-    matches[0][0].click(timeout=timeout_ms)
-    return matches[0][1]
+    return matches[0]
+
+
+def open_model_menu(page, timeout_ms, trigger_name=None):
+    target, current = model_trigger(page, timeout_ms, trigger_name)
+    target.click(timeout=timeout_ms)
+    return current
 
 
 def perform_workflow(page, args):
@@ -550,20 +597,28 @@ def perform_workflow(page, args):
         detail["conversationId"] = conversation_id_from_url(page.url)
         detail["promptLength"] = len(args.prompt)
     elif action == "conversation-send-now":
+        previous_messages = user_message_count(page, args.prompt, args.timeout_ms)
         input_target = message_input(page)
         input_target.fill(args.prompt, timeout=args.timeout_ms)
         input_target.press("Enter", timeout=args.timeout_ms)
+        deadline = time.monotonic() + args.timeout_ms / 1000
         page.wait_for_timeout(args.settle_ms)
-        send_now = queued_send_now_target(page, args.prompt)
-        send_now.click(timeout=args.timeout_ms)
-        page.wait_for_timeout(args.settle_ms)
-        try:
-            queued_send_now_target(page, args.prompt)
-        except ControlError:
-            pass
-        else:
-            raise ControlError("Send Now 已点击，但补充内容仍在队列中；不要自动重试")
-        detail.update({"promptLength": len(args.prompt), "sentImmediately": True})
+        injected = False
+        while True:
+            send_now = queued_send_now_target(page, args.prompt, allow_missing=True)
+            if send_now is not None and not injected:
+                send_now.click(timeout=args.timeout_ms)
+                injected = True
+            elif send_now is None and (
+                injected or user_message_count(page, args.prompt, args.timeout_ms) > previous_messages
+            ):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ControlError("消息已提交，但尚无法确认立即发送结果；不要自动重试")
+            page.wait_for_timeout(min(50, remaining * 1000))
+        detail.update({"promptLength": len(args.prompt), "sentImmediately": True,
+                       "delivery": "send-now" if injected else "direct"})
     elif action == "conversation-switch":
         page.keyboard.press("Control+K")
         page.wait_for_timeout(args.settle_ms)
@@ -592,17 +647,31 @@ def perform_workflow(page, args):
     elif action == "model-set":
         current = open_model_menu(page, args.timeout_ms, args.trigger_name)
         page.wait_for_timeout(args.settle_ms)
-        if args.model not in current:
-            unique_text_target(
-                page,
+        if " ".join(args.model.split()) != current:
+            menus = page.locator('[role="menu"]:visible, [role="listbox"]:visible')
+            scope = menus.nth(0) if menus.count() == 1 else page
+            option = unique_text_target(
+                scope,
                 args.model,
                 exact=not args.contains,
                 nth=args.nth,
-            ).click(timeout=args.timeout_ms)
-            detail["changed"] = True
+            )
+            expected = " ".join(option.inner_text(timeout=args.timeout_ms).split())
+            option.click(timeout=args.timeout_ms)
+            page.keyboard.press("Escape")
+            deadline = time.monotonic() + args.timeout_ms / 1000
+            while True:
+                _, selected = model_trigger(page, args.timeout_ms, args.trigger_name)
+                if selected == expected:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ControlError(f"模型选项已点击，但当前模型仍为 {selected}")
+                page.wait_for_timeout(min(50, remaining * 1000))
+            detail.update({"changed": selected != current, "selected": selected})
         else:
             page.keyboard.press("Escape")
-            detail["changed"] = False
+            detail.update({"changed": False, "selected": current})
         detail.update({"before": current, "model": args.model})
     elif action == "project-list":
         _, detail["projects"] = desktop_projects(
@@ -677,6 +746,10 @@ def perform_workflow(page, args):
         before_approval = approval_dialog_snapshot(page)
         if not before_approval.get("open"):
             raise ControlError("当前会话没有可见的命令审批对话框")
+        if not getattr(args, "dialog_fingerprint", None) or (
+            before_approval.get("fingerprint") != args.dialog_fingerprint
+        ):
+            raise ControlError("当前审批内容与检查结果不一致，请重新检查审批对话框")
         matching_options = [
             option
             for option in before_approval.get("options", [])
@@ -698,6 +771,15 @@ def perform_workflow(page, args):
         target, _, _ = resolve_role_target(
             page, "button", args.button_name, exact=True, nth=None
         )
+        current_approval = approval_dialog_snapshot(page)
+        if not current_approval.get("open") or (
+            current_approval.get("fingerprint") != args.dialog_fingerprint
+        ):
+            raise ControlError("审批内容在响应前发生变化，请重新检查审批对话框")
+        before_click = getattr(args, "before_approval_click", None)
+        if before_click:
+            before_click()
+        args.approval_click_started = True
         target.click(timeout=args.timeout_ms)
         page.wait_for_timeout(args.settle_ms)
         after_approval = approval_dialog_snapshot(page)
