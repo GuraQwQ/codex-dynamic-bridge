@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -16,7 +17,8 @@ from urllib.parse import parse_qs, urlparse
 
 VERSION = "0.5.0"
 MAX_BODY_BYTES = 1_048_576
-ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,128}$")
+ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
+SCHEDULE_WORKERS = 4
 EVENT_FIELDS = {
     "kind",
     "conversationId",
@@ -62,6 +64,7 @@ def data_dir():
 DATA_DIR = data_dir()
 EVENTS_PATH = DATA_DIR / "events.jsonl"
 SCHEDULES_PATH = DATA_DIR / "schedules.json"
+EVENT_LOCK = threading.Lock()
 SCHEDULE_LOCK = threading.Lock()
 
 
@@ -99,6 +102,37 @@ def run_agentapi(arguments, timeout=300):
     return parsed
 
 
+def validate_prompt(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("prompt 必须是非空字符串")
+    return value
+
+
+def validate_conversation_id(value, optional=False):
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not ID_PATTERN.fullmatch(value):
+        raise ValueError("conversation ID 必须为 1..128 位字母、数字或连字符，且以字母或数字开头")
+    return value
+
+
+def validate_event(event):
+    if not isinstance(event, dict):
+        raise ValueError("事件必须是 JSON 对象")
+    validate_conversation_id(event.get("conversationId"))
+    if not isinstance(event.get("kind"), str) or not event["kind"].strip():
+        raise ValueError("事件 kind 必须是非空字符串")
+    observed_at = event.get("observedAt")
+    if not isinstance(observed_at, str):
+        raise ValueError("事件 observedAt 必须是带时区的 ISO 8601 时间戳")
+    try:
+        timestamp = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("事件 observedAt 必须是带时区的 ISO 8601 时间戳") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("事件 observedAt 必须包含时区")
+
+
 def append_event(payload):
     event = {key: payload[key] for key in EVENT_FIELDS if key in payload}
     tool_call = payload.get("toolCall")
@@ -109,50 +143,71 @@ def append_event(payload):
         event.setdefault("approvalState", "requested")
         event.setdefault("status", "waiting_approval")
     event.setdefault("observedAt", utc_now())
-    if not event.get("conversationId"):
-        raise ValueError("事件缺少 conversationId")
-    with EVENTS_PATH.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+    validate_event(event)
+    encoded = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+    with EVENT_LOCK, EVENTS_PATH.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell():
+            stream.seek(-1, os.SEEK_END)
+            if stream.read(1) != b"\n":
+                # 保留中断留下的尾行，以分隔符隔离下一条完整事件。
+                stream.write(b"\n")
+        stream.write(encoded)
         stream.flush()
         os.fsync(stream.fileno())
     return event
 
 
 def list_events(conversation_id=None, limit=100, after=None, stream_id=None):
-    try:
-        stream = EVENTS_PATH.open("r", encoding="utf-8")
-    except FileNotFoundError:
-        return {"events": [], "nextCursor": 0, "hasMore": False,
-                "streamId": "empty", "reset": bool(after or stream_id not in (None, "empty"))}
-    with stream:
-        stat = os.fstat(stream.fileno())
-        identity = f"{stat.st_dev}:{stat.st_ino}:{getattr(stat, 'st_birthtime_ns', 0)}"
-        current_id = hashlib.sha256(identity.encode("ascii")).hexdigest()
-        reset = stream_id is not None and stream_id != current_id
-        start = 0 if reset else (after or 0)
-        while True:
-            events = deque(maxlen=limit)
-            cursor = 0
-            has_more = False
-            for line_number, line in enumerate(stream, start=1):
-                # 正在追加的尾行尚未提交，留给下一次查询。
-                if not line.endswith("\n"):
-                    break
-                if line_number > start and line.strip():
-                    event = json.loads(line)
-                    if not conversation_id or event.get("conversationId") == conversation_id:
-                        if after is not None and len(events) == limit:
-                            has_more = True
-                            break
-                        events.append(event)
-                cursor = line_number
-            if cursor < start:
-                start = 0
-                reset = True
-                stream.seek(0)
-                continue
-            return {"events": list(events), "nextCursor": cursor, "hasMore": has_more,
-                    "streamId": current_id, "reset": reset}
+    with EVENT_LOCK:
+        try:
+            stream = EVENTS_PATH.open("rb")
+        except FileNotFoundError:
+            return {"events": [], "nextCursor": 0, "hasMore": False,
+                    "streamId": "empty", "reset": bool(after or stream_id not in (None, "empty")),
+                    "corruptLines": [], "incompleteLine": None}
+        with stream:
+            return read_event_page(stream, conversation_id, limit, after, stream_id)
+
+
+def read_event_page(stream, conversation_id, limit, after, stream_id):
+    stat = os.fstat(stream.fileno())
+    identity = f"{stat.st_dev}:{stat.st_ino}:{getattr(stat, 'st_birthtime_ns', 0)}"
+    current_id = hashlib.sha256(identity.encode("ascii")).hexdigest()
+    reset = stream_id is not None and stream_id != current_id
+    start = 0 if reset else (after or 0)
+    while True:
+        events = deque(maxlen=limit)
+        cursor = 0
+        has_more = False
+        corrupt_lines = []
+        incomplete_line = None
+        for line_number, line in enumerate(stream, start=1):
+            # 正在追加的尾行尚未提交，留给下一次查询。
+            if not line.endswith(b"\n"):
+                incomplete_line = line_number
+                break
+            if line_number > start and line.strip():
+                try:
+                    event = json.loads(line.decode("utf-8"))
+                    validate_event(event)
+                except ValueError:
+                    corrupt_lines.append(line_number)
+                    event = None
+                if event is not None and (not conversation_id or event.get("conversationId") == conversation_id):
+                    if after is not None and len(events) == limit:
+                        has_more = True
+                        break
+                    events.append(event)
+            cursor = line_number
+        if cursor < start:
+            start = 0
+            reset = True
+            stream.seek(0)
+            continue
+        return {"events": list(events), "nextCursor": cursor, "hasMore": has_more,
+                "streamId": current_id, "reset": reset,
+                "corruptLines": corrupt_lines, "incompleteLine": incomplete_line}
 
 
 def load_schedules():
@@ -168,13 +223,16 @@ def save_schedules(schedules):
 
 def execute_schedule(schedule):
     try:
-        if schedule.get("conversationId"):
+        prompt = validate_prompt(schedule.get("prompt"))
+        conversation_id = validate_conversation_id(schedule.get("conversationId"), optional=True)
+        if conversation_id:
             result = run_agentapi(
-                ["send-message", schedule["conversationId"], schedule["prompt"]]
+                ["send-message", conversation_id, prompt]
             )
         else:
-            result = run_agentapi(["new-conversation", schedule["prompt"]])
+            result = run_agentapi(["new-conversation", prompt])
         schedule["lastStatus"] = "success"
+        schedule.pop("lastError", None)
         conversation_id = result.get("conversationId") if isinstance(result, dict) else None
         if conversation_id:
             schedule["lastConversationId"] = conversation_id
@@ -185,36 +243,53 @@ def execute_schedule(schedule):
     schedule["nextRunEpoch"] = time.time() + schedule["intervalSeconds"]
 
 
-def scheduler_loop():
-    while True:
-        time.sleep(1)
+def run_scheduled_task(schedule, running):
+    try:
+        execute_schedule(schedule)
+        with SCHEDULE_LOCK:
+            schedules = load_schedules()
+            current = next((item for item in schedules if item.get("id") == schedule["id"]), None)
+            if current:
+                current.pop("lastError", None)
+                current.update({key: value for key, value in schedule.items()
+                                if key.startswith("last") or key == "nextRunEpoch"})
+                save_schedules(schedules)
+    finally:
+        with SCHEDULE_LOCK:
+            running.discard(schedule["id"])
+
+
+def scheduler_loop(stop_event=None):
+    stop_event = stop_event or threading.Event()
+    running = set()
+    with SCHEDULE_LOCK:
+        schedules = load_schedules()
+        recovered = False
+        for schedule in schedules:
+            if schedule.get("lastStatus") == "running":
+                # 上次发送结果未知，按周期继续，避免重启后立即重复发送。
+                schedule.update(lastStatus="interrupted", lastError="Sidecar 重启，上次执行结果未知",
+                                nextRunEpoch=time.time() + schedule["intervalSeconds"])
+                recovered = True
+        if recovered:
+            save_schedules(schedules)
+    while not stop_event.is_set():
         with SCHEDULE_LOCK:
             schedules = load_schedules()
             due = []
             for schedule in schedules:
-                if schedule.get("enabled", True) and schedule.get("nextRunEpoch", 0) <= time.time():
-                    schedule["nextRunEpoch"] = time.time() + schedule["intervalSeconds"]
+                if len(running) >= SCHEDULE_WORKERS:
+                    break
+                if (schedule.get("enabled", True) and schedule["id"] not in running
+                        and schedule.get("nextRunEpoch", 0) <= time.time()):
+                    running.add(schedule["id"])
                     schedule["lastStatus"] = "running"
                     due.append(dict(schedule))
             if due:
                 save_schedules(schedules)
         for scheduled_run in due:
-            execute_schedule(scheduled_run)
-            with SCHEDULE_LOCK:
-                schedules = load_schedules()
-                current = next(
-                    (item for item in schedules if item.get("id") == scheduled_run["id"]),
-                    None,
-                )
-                if current:
-                    current.update(
-                        {
-                            key: value
-                            for key, value in scheduled_run.items()
-                            if key.startswith("last") or key == "nextRunEpoch"
-                        }
-                    )
-                    save_schedules(schedules)
+            threading.Thread(target=run_scheduled_task, args=(scheduled_run, running), daemon=True).start()
+        stop_event.wait(1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -232,7 +307,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def authorized(self):
-        return self.headers.get("Authorization") == f"Bearer {self.server.token}"
+        return hmac.compare_digest(
+            self.headers.get("Authorization", "").encode("utf-8"),
+            f"Bearer {self.server.token}".encode("utf-8"),
+        )
 
     def read_json(self):
         try:
@@ -288,15 +366,13 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.read_json()
             prompt = payload.get("prompt", "")
             if parsed.path == "/v1/conversations":
-                if not prompt.strip():
-                    raise ValueError("prompt 不能为空")
+                validate_prompt(prompt)
                 self.respond(200, run_agentapi(["new-conversation", prompt]))
                 return
             match = re.fullmatch(r"/v1/conversations/([^/]+)/messages", parsed.path)
             if match:
-                conversation_id = match.group(1)
-                if not ID_PATTERN.fullmatch(conversation_id) or not prompt.strip():
-                    raise ValueError("conversation ID 或 prompt 无效")
+                conversation_id = validate_conversation_id(match.group(1))
+                validate_prompt(prompt)
                 self.respond(
                     200,
                     run_agentapi(["send-message", conversation_id, prompt]),
@@ -306,13 +382,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, append_event(payload))
                 return
             if parsed.path == "/v1/schedules":
-                interval = int(payload.get("intervalSeconds", 0))
-                if interval < 60 or not prompt.strip():
-                    raise ValueError("intervalSeconds 至少为 60，且 prompt 不能为空")
+                interval = payload.get("intervalSeconds")
+                if type(interval) is not int or interval < 60:
+                    raise ValueError("intervalSeconds 必须为至少 60 的整数")
+                validate_prompt(prompt)
+                conversation_id = validate_conversation_id(payload.get("conversationId"), optional=True)
                 schedule = {
                     "id": str(uuid.uuid4()),
                     "prompt": prompt,
-                    "conversationId": payload.get("conversationId"),
+                    "conversationId": conversation_id,
                     "intervalSeconds": interval,
                     "enabled": True,
                     "createdAt": utc_now(),
@@ -364,10 +442,12 @@ def main():
         os.chmod(endpoint_path, 0o600)
     except OSError:
         pass
-    threading.Thread(target=scheduler_loop, daemon=True).start()
+    scheduler_stop = threading.Event()
+    threading.Thread(target=scheduler_loop, args=(scheduler_stop,), daemon=True).start()
     try:
         server.serve_forever()
     finally:
+        scheduler_stop.set()
         server.server_close()
         endpoint_path.unlink(missing_ok=True)
 
