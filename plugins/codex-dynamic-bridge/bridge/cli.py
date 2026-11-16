@@ -187,13 +187,11 @@ def add_link(args):
     saved = next(item for item in merged if item["id"] == link["id"])
     changed = saved == link and link not in existing
     result = {"changed": changed, "link": saved}
-    print(json.dumps(result, ensure_ascii=False, indent=2))
     return result
 
 
 def list_links(_):
     links = load_links()
-    print(json.dumps(links, ensure_ascii=False, indent=2))
     return links
 
 
@@ -204,7 +202,6 @@ def remove_link(args):
         raise BridgeError(f"未找到链接: {args.id}")
     save_links(remaining)
     result = {"removed": args.id, "total": len(remaining)}
-    print(json.dumps(result, ensure_ascii=False, indent=2))
     return result
 
 
@@ -227,7 +224,6 @@ def sync_links(args):
         ),
         "total": len(merged),
     }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
     return result
 
 
@@ -351,13 +347,11 @@ def select_app_page(pages, target_id=None):
 
 def discover_links(_):
     sessions = discover_sessions()
-    print(json.dumps(sessions, ensure_ascii=False, indent=2))
     return sessions
 
 
 def discover_pages(_):
     pages = discover_app_pages()
-    print(json.dumps(pages, ensure_ascii=False, indent=2))
     return pages
 
 
@@ -399,7 +393,6 @@ def live_link(args):
     merged = merge_latest(load_links(), links)
     save_links(merged)
     output = links[0] if len(links) == 1 else links
-    print(json.dumps(output, ensure_ascii=False, indent=2))
     return output
 
 
@@ -419,13 +412,7 @@ def control_page(args):
     except ControlError as exc:
         raise BridgeError(str(exc)) from exc
     result["conversationId"] = session["conversationId"]
-    print(json.dumps(result, ensure_ascii=False, indent=2))
     return result
-
-
-def print_json(value):
-    print(json.dumps(value, ensure_ascii=False, indent=2))
-    return value
 
 
 def doctor_command(_):
@@ -461,7 +448,7 @@ def doctor_command(_):
             result["sidecar"]["error"] = str(exc)
     else:
         result["sidecar"]["available"] = False
-    return print_json(result)
+    return result
 
 
 def prompt_from_args(args):
@@ -514,24 +501,20 @@ def conversation_command(args):
         if args.backend in {"auto", "sidecar"}:
             try:
                 sidecar = SidecarClient()
-                return print_json(
-                    sidecar.wait(
-                        args.conversation_id,
-                        timeout_seconds=max(0, deadline - time.monotonic()),
-                        after=after,
-                    )
+                return sidecar.wait(
+                    args.conversation_id,
+                    timeout_seconds=max(0, deadline - time.monotonic()),
+                    after=after,
                 )
             except RuntimeWaitTimeout:
                 raise
             except RuntimeUnavailable:
                 if args.backend == "sidecar":
                     raise
-        return print_json(
-            event_store.wait(
-                args.conversation_id,
-                timeout_seconds=max(0, deadline - time.monotonic()),
-                after=after,
-            )
+        return event_store.wait(
+            args.conversation_id,
+            timeout_seconds=max(0, deadline - time.monotonic()),
+            after=after,
         )
 
     if args.conversation_action in {"send", "resume"} and not args.confirm_send:
@@ -559,6 +542,7 @@ def conversation_command(args):
             args.timeout_ms = min(args.timeout_seconds * 1000, 30000)
             args.settle_ms = 250
             args.prompt = prompt
+            args.prompt_stdin = False
             args.conversation_action = "send-now"
             return desktop_conversation_command(args)
     backend_name = args.backend
@@ -606,12 +590,12 @@ def conversation_command(args):
         )
     else:
         task = None
-    return print_json({"backend": backend, "result": result, "task": task, "submission": receipt})
+    return {"backend": backend, "result": result, "task": task, "submission": receipt}
 
 
 def model_command(args):
     if args.model_action == "list":
-        return print_json(AgyClient().list_models())
+        return AgyClient().list_models()
     raise BridgeError(f"不支持的模型动作: {args.model_action}")
 
 
@@ -619,7 +603,7 @@ def event_command(args):
     store = EventStore()
     tasks = TaskStore()
     if args.event_action == "sync":
-        return print_json(sync_events(SidecarClient(), store, tasks, args.conversation_id))
+        return sync_events(SidecarClient(), store, tasks, args.conversation_id)
     if args.event_action == "ingest":
         try:
             payload = json.load(sys.stdin)
@@ -627,9 +611,9 @@ def event_command(args):
             raise BridgeError("Hook 标准输入不是有效 JSON") from exc
         event = store.append(args.kind, payload)
         task = tasks.sync_event(event)
-        return print_json({"event": event, "task": task})
+        return {"event": event, "task": task}
     if args.event_action == "list":
-        return print_json(store.list(args.conversation_id, limit=args.limit))
+        return store.list(args.conversation_id, limit=args.limit)
     if args.event_action == "wait-approval":
         deadline = time.monotonic() + args.timeout_seconds
         after = format_timestamp(parse_timestamp(args.after)) if args.after else None
@@ -652,24 +636,20 @@ def event_command(args):
             else:
                 store.import_events([event])
                 tasks.sync_event(event)
-                return print_json(event)
-        return print_json(
-            store.wait_approval(
-                args.conversation_id,
-                timeout_seconds=max(0, deadline - time.monotonic()),
-                tool_name=args.tool_name,
-                after=after,
-            )
+                return event
+        return store.wait_approval(
+            args.conversation_id,
+            timeout_seconds=max(0, deadline - time.monotonic()),
+            tool_name=args.tool_name,
+            after=after,
         )
     receipt = SubmissionStore().latest(args.conversation_id)
     after = (format_timestamp(parse_timestamp(args.after)) if args.after
              else receipt["submittedAt"] if receipt else None)
-    return print_json(
-        store.wait(
-            args.conversation_id,
-            timeout_seconds=args.timeout_seconds,
-            after=after,
-        )
+    return store.wait(
+        args.conversation_id,
+        timeout_seconds=args.timeout_seconds,
+        after=after,
     )
 
 
@@ -678,7 +658,7 @@ def approval_command(args):
         store = ApprovalStore()
         lock_path = store.lock_path(args.id)
         with file_lock(lock_path):
-            result = run_desktop_workflow(args, "approval-inspect", emit=False)
+            result = run_desktop_workflow(args, "approval-inspect")
             snapshot = result.get("detail", {}).get("approval", {})
             if snapshot.get("open"):
                 try:
@@ -691,7 +671,7 @@ def approval_command(args):
                         "requestId": store.request_id(event),
                         "status": store.inspect(event, snapshot["fingerprint"]),
                     }
-        return print_json(result)
+        return result
     if not args.confirm_approval:
         raise BridgeError("响应命令审批会修改 Antigravity 状态；请传入 --confirm-approval")
 
@@ -708,12 +688,12 @@ def approval_command(args):
             raise BridgeError("指定审批已结束或已被后续请求替代；请重新检查当前审批")
         request_id, claimed = store.claim(event, args.dialog_fingerprint)
         if not claimed:
-            return print_json({"requestId": request_id, "status": "responded", "alreadyResponded": True})
+            return {"requestId": request_id, "status": "responded", "alreadyResponded": True}
 
         args.approval_click_started = False
         args.before_approval_click = lambda: store.finish(request_id, "responding")
         try:
-            result = run_desktop_workflow(args, "approval-respond", emit=False)
+            result = run_desktop_workflow(args, "approval-respond")
         except BaseException:
             store.finish(request_id, "uncertain" if args.approval_click_started else "retryable")
             raise
@@ -721,7 +701,7 @@ def approval_command(args):
             del args.before_approval_click
         store.finish(request_id, "responded")
     result["approvalResponse"] = {"requestId": request_id, "status": "responded"}
-    return print_json(result)
+    return result
 
 
 def review_command(args):
@@ -732,50 +712,46 @@ def schedule_command(args):
     client = SidecarClient()
     client.health()
     if args.schedule_action == "list":
-        return print_json(client.list_schedules())
+        return client.list_schedules()
     if args.schedule_action == "remove":
         if not args.confirm_schedule:
             raise BridgeError("删除定时任务会修改 Sidecar 状态；请传入 --confirm-schedule")
-        return print_json(client.remove_schedule(args.schedule_id))
+        return client.remove_schedule(args.schedule_id)
     if not args.confirm_schedule:
         raise BridgeError("创建定时任务会持续发送消息；请传入 --confirm-schedule")
-    return print_json(
-        client.create_schedule(
-            prompt_from_args(args),
-            args.interval_seconds,
-            conversation_id=args.conversation_id,
-        )
+    return client.create_schedule(
+        prompt_from_args(args),
+        args.interval_seconds,
+        conversation_id=args.conversation_id,
     )
 
 
 def activity_command(args):
-    return print_json(EventStore().summary(args.conversation_id))
+    return EventStore().summary(args.conversation_id)
 
 
 def companion_command(args):
     if args.companion_action == "status":
-        return print_json(companion_status())
+        return companion_status()
     if args.companion_action == "install-global":
         if not args.confirm_install:
             raise BridgeError("全局注册会修改 Antigravity 配置；请传入 --confirm-install")
-        return print_json(install_companion_global(args.project_id))
+        return install_companion_global(args.project_id)
     if not args.confirm_uninstall:
         raise BridgeError("卸载会删除全局 Companion；请传入 --confirm-uninstall")
-    return print_json(uninstall_companion_global())
+    return uninstall_companion_global()
 
 
 def setup_command(args):
     if args.setup_action == "status":
-        return print_json(
-            {
-                "agy": agy_install_status(install_dir=args.agy_dir, check_update=args.check_update),
-                "companion": companion_status(),
-            }
-        )
+        return {
+            "agy": agy_install_status(install_dir=args.agy_dir, check_update=args.check_update),
+            "companion": companion_status(),
+        }
     if args.setup_action == "clean":
         if not args.confirm_clean:
             raise BridgeError("清理会删除本安装器的下载缓存；请传入 --confirm-clean")
-        return print_json(clean_agy_cache(install_dir=args.agy_dir, allow_system_drive=args.allow_system_drive))
+        return clean_agy_cache(install_dir=args.agy_dir, allow_system_drive=args.allow_system_drive)
     if not args.confirm_setup:
         raise BridgeError("完整能力装载会安装 agy 并修改 Antigravity 配置；请传入 --confirm-setup")
     agy = ensure_agy(
@@ -784,27 +760,27 @@ def setup_command(args):
         update=args.refresh_agy,
     )
     if agy.get("pending"):
-        return print_json({"agy": agy, "companion": companion_status(), "complete": False})
+        return {"agy": agy, "companion": companion_status(), "complete": False}
     companion = install_companion_global(args.project_id)
-    return print_json({"agy": agy, "companion": companion})
+    return {"agy": agy, "companion": companion}
 
 
 def task_command(args):
     store = TaskStore()
     if args.task_action == "inspect":
-        return print_json(SubmissionStore().inspect(
+        return SubmissionStore().inspect(
             EventStore(), conversation_id=args.conversation_id, submission_id=args.submission_id
-        ))
+        )
     if args.task_action == "submissions":
-        return print_json(SubmissionStore().list(args.conversation_id))
+        return SubmissionStore().list(args.conversation_id)
     if args.task_action == "record-review":
         if not args.confirm_review:
             raise BridgeError("记录验收结论需明确授权；请传入 --confirm-review")
-        return print_json(SubmissionStore().record_review(args.submission_id, args.verdict, args.evidence))
+        return SubmissionStore().record_review(args.submission_id, args.verdict, args.evidence)
     if args.task_action == "list":
-        return print_json(store.load())
+        return store.load()
     if args.task_action == "remove":
-        return print_json(store.remove(args.conversation_id))
+        return store.remove(args.conversation_id)
     record = {
         "conversationId": args.conversation_id,
         "codexTaskId": args.codex_task_id,
@@ -817,20 +793,18 @@ def task_command(args):
     if getattr(args, "submission_id", None):
         receipt = SubmissionStore().bind(args.submission_id, args.conversation_id)
         record.update({"submissionId": receipt["submissionId"], "lastSubmittedAt": receipt["submittedAt"]})
-    return print_json(store.upsert(record))
+    return store.upsert(record)
 
 
 def artifact_command(args):
     root = artifact_root_for_conversation(EventStore(), args.conversation_id)
     if args.artifact_action == "list":
-        return print_json(
-            {"root": str(root), "artifacts": list_artifacts(root, limit=args.limit)}
-        )
+        return {"root": str(root), "artifacts": list_artifacts(root, limit=args.limit)}
     content = read_artifact(root, args.path, max_bytes=args.max_bytes)
-    return print_json({"root": str(root), "path": args.path, "content": content})
+    return {"root": str(root), "path": args.path, "content": content}
 
 
-def run_desktop_workflow(args, workflow_action, allow_shell=False, emit=True):
+def run_desktop_workflow(args, workflow_action, allow_shell=False):
     from bridge.control import ControlError, execute_control
 
     args.control_action = "workflow"
@@ -861,7 +835,7 @@ def run_desktop_workflow(args, workflow_action, allow_shell=False, emit=True):
     if page:
         result["sourceDevtoolsId"] = page["devtoolsId"]
         result["bootstrappedFromShell"] = page["kind"] == "shell"
-    return print_json(result) if emit else result
+    return result
 
 
 def run_new_conversation_workflow(args):
@@ -887,7 +861,7 @@ def run_new_conversation_workflow(args):
     result["submission"] = receipt
     result["sourceDevtoolsId"] = page["devtoolsId"]
     result["bootstrappedFromShell"] = page["kind"] == "shell"
-    return print_json(result)
+    return result
 
 
 def desktop_conversation_command(args):
@@ -1045,6 +1019,7 @@ def build_parser():
         prog="codex-dynamic-bridge",
         description="发现 Antigravity 会话元数据，并管理本地任务链接快照。",
     )
+    parser.add_argument("--verbose", action="store_true", help="输出完整详细 JSON；放在子命令前")
     parser.add_argument(
         "--store",
         type=Path,
@@ -1459,6 +1434,10 @@ def build_parser():
         type=nonnegative_integer,
         help="多匹配时显式选择从 0 开始的序号",
     )
+    read_parser.add_argument("--after-message", type=nonnegative_integer, default=0,
+                             help="从指定消息索引开始读取，默认 0")
+    read_parser.add_argument("--limit", type=nonnegative_integer,
+                             help="本次最多读取的消息数；省略时读取剩余消息")
     read_parser.set_defaults(func=control_page)
 
     snapshot_parser = control_subparsers.add_parser(
@@ -1555,6 +1534,39 @@ def build_parser():
     return parser
 
 
+def compact_output(value, args):
+    if not isinstance(value, dict):
+        return value
+
+    def has_error(item):
+        if isinstance(item, dict):
+            return any(("error" in key.lower() and content)
+                       or (key in {"status", "delivery"} and isinstance(content, str) and content in {
+                           "outcome_unknown", "uncertain", "failed", "error"
+                       }) or has_error(content) for key, content in item.items())
+        if isinstance(item, list):
+            return any(has_error(content) for content in item)
+        return False
+
+    if has_error(value):
+        return value
+    output = dict(value)
+    if getattr(args, "control_action", None) == "read":
+        for field in ("textLength", "page"):
+            output.pop(field, None)
+        if isinstance(output.get("messages"), list):
+            output.pop("content", None)
+            output.pop("contentLength", None)
+            output["messages"] = [
+                {key: content for key, content in message.items() if key != "textLength"}
+                for message in output["messages"]
+            ]
+    if output.get("completed") is True:
+        for field in ("pageBefore", "pageAfter", "matchCount", "controlCount"):
+            output.pop(field, None)
+    return output
+
+
 def main(argv=None):
     global LINKS_PATH
     configure_standard_streams()
@@ -1563,7 +1575,10 @@ def main(argv=None):
     if args.store:
         LINKS_PATH = args.store.expanduser()
     try:
-        args.func(args)
+        result = args.func(args)
+        output = result if args.verbose else compact_output(result, args)
+        print(json.dumps(output, ensure_ascii=False, indent=2 if args.verbose else None,
+                         separators=None if args.verbose else (",", ":")))
     except (
         BridgeError,
         CompanionError,

@@ -20,6 +20,8 @@ description: 发现、读取、创建和管理 Antigravity 会话、模型、项
 python -m bridge.cli <command>
 ```
 
+CLI 默认只输出一份紧凑 JSON。已完成的工作流保留 ID、状态、投递回执和业务结果，省略页面前后快照及控件统计；会话正文读取省略页面信息和重复正文。错误和结果未知时保留诊断，显式 `control inspect`/`snapshot` 保留所请求的页面详情。需要完整输出时，把全局 `--verbose` 放在子命令前，例如 `python -m bridge.cli --verbose conversation send-now ...`。
+
 ## 先探测能力
 
 每个新任务先运行：
@@ -66,7 +68,7 @@ python -m bridge.cli companion uninstall-global --confirm-uninstall
 2. `agy`：指定项目、模型、effort 的结构化 headless 会话。
 3. Desktop CDP：当前页面读取、可访问性快照和语义 UI 控制。
 
-如果用户要求监工或中途追加，且目标桌面会话正在运行，必须使用 `conversation send --backend auto` 或 `conversation send-now`；`auto` 会检测到桌面页面后强制走 `Send Now`，不能改用 Sidecar 排队。只有用户明确指定 `--backend sidecar` 或目标没有桌面页面时，才使用 Sidecar/`agy`。Companion/`agy` 适合不需要实时干预的 headless 任务。
+如果用户要求监工或中途追加，且目标桌面会话正在运行，使用 `conversation send --backend auto` 或 `conversation send-now` 立即注入。普通 `auto send` 检测桌面后使用同一工作流，空闲时验证直接发送，执行中验证队列立即发送；指定模型、effort、agent 或使用 `resume` 时走支持这些参数的 `agy`。Companion/`agy` 适合不需要实时干预的 headless 任务。
 
 写操作一旦开始，不要因失败自动切换后端重试；错误可能发生在后置验证阶段，而动作本身已经生效。
 
@@ -82,10 +84,11 @@ python -m bridge.cli control inspect --id <id>
 
 ## 只读操作
 
-用户明确要求读取、总结或检查会话正文时，该请求本身即授权读取所选会话的可见文本。`control read`/`snapshot` 省略选择器时只读取 User/Agent 消息 article 和相关控件，自动排除侧栏、项目列表、菜单、历史会话和无关 DOM；只有用户显式传入 `--selector body` 才读取整页：
+用户明确要求读取、总结或检查会话正文时，该请求本身即授权读取所选会话的可见文本。`control read`/`snapshot` 省略选择器时按会话消息功能属性读取正文和相关控件，自动排除侧栏、项目列表、菜单、历史会话和无关 DOM；只有用户显式传入 `--selector body` 才读取整页：
 
 ```powershell
 python -m bridge.cli control read --id <id>
+python -m bridge.cli control read --id <id> --after-message <nextMessageIndex> --limit 5
 python -m bridge.cli control snapshot --id <id>
 python -m bridge.cli settings read --id <id>
 python -m bridge.cli model desktop-list --id <id>
@@ -93,6 +96,8 @@ python -m bridge.cli usage --id <id>
 python -m bridge.cli activity --conversation-id <id>
 python -m bridge.cli artifact list --conversation-id <id>
 ```
+
+会话正文默认通过 `messages` 返回一次，包含消息索引、角色和正文；`messageCount` 是当前消息总数，`nextMessageIndex` 用于下次增量读取。`running: true` 且读到末尾时保留最后一条的索引，下次可读到流式回复的更新；执行停止后再推进。消息总数小于旧游标时返回 `cursorReset: true` 并从头读取。`--after-message` 默认 0，`--limit` 省略时读取其后全部消息；有 `--selector` 时读取指定元素。只有需要完整诊断时使用 `--verbose`，不要在轮询中反复读取整段历史。
 
 可访问性快照比长期 CSS 选择器稳定。页面变化后重新生成快照，不复用旧控件含义。
 

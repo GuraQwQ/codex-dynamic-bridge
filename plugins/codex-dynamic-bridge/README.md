@@ -328,18 +328,20 @@ python -m bridge.cli control read --id <conversation-id>
 python -m bridge.cli control read --id <conversation-id> --selector "main"
 
 # 获取唯一元素的摘要状态
-python -m bridge.cli control get --id <conversation-id> --selector "button[aria-label='发送']"
+python -m bridge.cli control get --id <conversation-id> --selector "button[data-testid='send-button']"
 
 # 等待元素
 python -m bridge.cli control wait --id <conversation-id> --selector "body" --state visible
 
 # 页面修改必须显式确认
-python -m bridge.cli control click --id <conversation-id> --selector "button[aria-label='发送']" --confirm-control
+python -m bridge.cli control click --id <conversation-id> --selector "button[data-testid='send-button']" --confirm-control
 python -m bridge.cli control fill --id <conversation-id> --selector "[contenteditable='true']" --text "内容" --confirm-control
 python -m bridge.cli control press --id <conversation-id> --selector "[contenteditable='true']" --key Enter --confirm-control
 ```
 
-`aria-label` 等选择器取决于 Antigravity 的实际界面语言。示例中的“发送”只适用于对应中文界面，执行前应先观察真实 DOM。
+新建、发送、模型和消息读取优先使用已观察到的 `data-testid` 与所属区域，避免依赖中英文文案；缺少稳定属性时再使用精确的双语语义名称。执行前仍应观察实际 DOM。
+
+CLI 默认输出紧凑 JSON，成功动作省略页面快照，会话正文只返回一次；用 `python -m bridge.cli --verbose ...` 获取完整结果。增量读取用 `control read --id <id> --after-message <nextMessageIndex> --limit 5`；`running: true` 时末条游标保留，以继续读取尚在生成的回复。
 
 多行或敏感填充内容可通过标准输入传入：
 
@@ -781,25 +783,27 @@ python -m bridge.cli discover
 # Inspect page state
 python -m bridge.cli control inspect --id <conversation-id>
 
-# Read complete visible text; defaults to body
+# Read conversation messages, excluding the sidebar and other chats
 python -m bridge.cli control read --id <conversation-id>
 
 # Narrow the read scope
 python -m bridge.cli control read --id <conversation-id> --selector "main"
 
 # Get a summary of one unique element
-python -m bridge.cli control get --id <conversation-id> --selector "button[aria-label='Send']"
+python -m bridge.cli control get --id <conversation-id> --selector "button[data-testid='send-button']"
 
 # Wait for an element
 python -m bridge.cli control wait --id <conversation-id> --selector "body" --state visible
 
 # Mutations require explicit confirmation
-python -m bridge.cli control click --id <conversation-id> --selector "button[aria-label='Send']" --confirm-control
+python -m bridge.cli control click --id <conversation-id> --selector "button[data-testid='send-button']" --confirm-control
 python -m bridge.cli control fill --id <conversation-id> --selector "[contenteditable='true']" --text "Content" --confirm-control
 python -m bridge.cli control press --id <conversation-id> --selector "[contenteditable='true']" --key Enter --confirm-control
 ```
 
-Selectors such as `aria-label` depend on Antigravity's actual UI language. The `Send` example only applies to a matching English UI; inspect the real DOM before acting.
+New, send, model, and message controls prefer observed `data-testid` attributes and their owning region; exact bilingual accessible names are a fallback. Inspect the actual DOM before acting.
+
+CLI output is compact JSON by default. Successful actions omit page snapshots, and message text appears once. Use `python -m bridge.cli --verbose ...` for full results. Read incrementally with `control read --id <id> --after-message <nextMessageIndex> --limit 5`; while `running: true`, the last message remains at the cursor so streaming updates can be read again.
 
 Pass multiline or sensitive fill text through standard input:
 

@@ -111,7 +111,13 @@ def read_target_text(target, timeout_ms):
 
 
 def conversation_message_targets(page):
-    """只选择会话正文 article，排除导航、项目列表和菜单。"""
+    """按消息属性选择会话正文，排除导航、项目列表和菜单。"""
+    messages = page.locator(
+        '[data-testid="conversation-view"] [data-testid="user-message"], '
+        '[data-testid="conversation-view"] [data-testid="agent-response"]'
+    )
+    if messages.count():
+        return messages
     articles = page.locator(
         '[role="article"][aria-label="User message"], '
         '[role="article"][aria-label="Agent response"]'
@@ -124,15 +130,19 @@ def conversation_message_targets(page):
     raise ControlError("无法识别 Antigravity 会话正文区域，拒绝读取整页噪声")
 
 
-def read_conversation_text(page, timeout_ms):
+def read_conversation_text(page, timeout_ms, after_message=0, limit=None):
     targets = conversation_message_targets(page)
+    total = targets.count()
+    start = after_message if after_message <= total else 0
+    stop = total if limit is None else min(total, start + limit)
+    running = page.locator('button[data-testid="input-cancel-button"]:visible').count() == 1
     messages = []
-    for index in range(targets.count()):
+    for index in range(start, stop):
         target = targets.nth(index)
         messages.append(
             {
                 "index": index,
-                "role": target.get_attribute("aria-label"),
+                "role": target.get_attribute("data-testid") or target.get_attribute("aria-label"),
                 **read_target_text(target, timeout_ms),
             }
         )
@@ -140,7 +150,10 @@ def read_conversation_text(page, timeout_ms):
     return {
         "content": content,
         "textLength": len(content),
-        "messageCount": len(messages),
+        "messageCount": total,
+        "nextMessageIndex": stop - 1 if running and stop == total and stop > start else stop,
+        "running": running,
+        "cursorReset": after_message > total,
         "messages": messages,
     }
 
@@ -153,7 +166,7 @@ def snapshot_conversation(page, timeout_ms, max_controls):
         messages.append(
             {
                 "index": index,
-                "role": target.get_attribute("aria-label"),
+                "role": target.get_attribute("data-testid") or target.get_attribute("aria-label"),
                 "text": read_target_text(target, timeout_ms),
                 "snapshot": snapshot_target(target, timeout_ms, max_controls),
             }
@@ -226,6 +239,19 @@ def resolve_role_target(page, role, name, exact=True, nth=None):
     return locator.nth(index), count, index
 
 
+def functional_button(page, test_id, names):
+    locator = page.locator(f'button[data-testid="{test_id}"]')
+    count = locator.count()
+    if count:
+        if count != 1:
+            raise ControlError(f"功能按钮标识必须唯一: {test_id}，实际匹配 {count} 个")
+        return locator.nth(0)
+    target, _, _ = resolve_role_target(
+        page, "button", re.compile("^(?:" + "|".join(re.escape(name) for name in names) + ")$"), exact=True
+    )
+    return target
+
+
 def wait_for_target(page, selector, state, timeout_ms, nth=None):
     locator = page.locator(selector)
     index = nth if nth is not None else 0
@@ -261,6 +287,11 @@ def unique_text_target(page, text, exact=True, nth=None):
 
 
 def message_input(page):
+    locator = page.locator('[data-testid="agent-input-box"] [contenteditable="true"][data-lexical-editor="true"]')
+    if locator.count() == 1:
+        return locator.nth(0)
+    if locator.count() > 1:
+        raise ControlError("消息输入区域存在多个编辑器，请检查当前界面")
     candidates = (
         ("combobox", "Message input"),
         ("textbox", "Message input"),
@@ -444,7 +475,11 @@ def approval_dialog_snapshot(page):
 
 
 def queued_send_now_target(page, prompt, allow_missing=False):
-    buttons = page.get_by_role("button", name="Send Now", exact=True)
+    cards = page.locator('[data-testid="queued-messages-card"]')
+    scope = cards.nth(0) if cards.count() == 1 else page
+    buttons = scope.get_by_role(
+        "button", name=re.compile(r"^(?:Send now(?:[:：].*)?|立即发送(?:[:：].*)?)$", re.IGNORECASE)
+    )
     matches = []
     for index in range(buttons.count()):
         button = buttons.nth(index)
@@ -452,8 +487,9 @@ def queued_send_now_target(page, prompt, allow_missing=False):
             """(candidate, expected) => {
                 let current = candidate.parentElement;
                 for (let depth = 0; current && depth < 8; depth += 1) {
+                    if (current.getAttribute('data-testid') === 'queued-messages-card') return false;
                     const text = String(current.innerText || current.textContent || '');
-                    if (text.includes(expected)) return true;
+                    if (text.includes(expected.trim())) return true;
                     if (depth > 0 && /Queued Messages|排队消息/.test(text)) return false;
                     current = current.parentElement;
                 }
@@ -472,7 +508,9 @@ def queued_send_now_target(page, prompt, allow_missing=False):
 
 
 def user_message_count(page, prompt, timeout_ms):
-    messages = page.locator('[role="article"][aria-label="User message"]')
+    messages = page.locator('[data-testid="conversation-view"] [data-testid="user-message-content"]')
+    if not messages.count():
+        messages = page.locator('[role="article"][aria-label="User message"]')
     return sum(
         messages.nth(index).inner_text(timeout=timeout_ms).strip() == prompt.strip()
         for index in range(messages.count())
@@ -513,6 +551,12 @@ def review_region_target(page):
 
 
 def model_trigger(page, timeout_ms, trigger_name=None):
+    stable = page.locator('button[data-testid="model-selector-trigger"]')
+    if stable.count() == 1:
+        target = stable.nth(0)
+        return target, " ".join(target.inner_text(timeout=timeout_ms).split())
+    if stable.count() > 1:
+        raise ControlError("模型选择器标识匹配了多个按钮")
     if trigger_name:
         targets = page.get_by_role("button", name=trigger_name, exact=False)
         if targets.count() == 1:
@@ -562,30 +606,15 @@ def perform_workflow(page, args):
                 page, args.timeout_ms, args.settle_ms, project_id=project_id
             )
         else:
-            new_button, _, _ = resolve_role_target(
-                page,
-                "button",
-                "New Conversation",
-                exact=True,
-            )
+            new_button = functional_button(page, "app-icon-new-conversation-button", ("New Conversation", "新建会话"))
             new_button.click(timeout=args.timeout_ms)
             page.wait_for_url(
                 lambda url: trusted_page_url(url) and conversation_id_from_url(url) is None,
                 timeout=args.timeout_ms,
             )
-        input_target, _, _ = resolve_role_target(
-            page,
-            "combobox",
-            "Message input",
-            exact=True,
-        )
+        input_target = message_input(page)
         input_target.fill(args.prompt, timeout=args.timeout_ms)
-        send_button, _, _ = resolve_role_target(
-            page,
-            "button",
-            "Send message",
-            exact=True,
-        )
+        send_button = functional_button(page, "send-button", ("Send message", "发送消息"))
         send_button.click(timeout=args.timeout_ms)
         page.wait_for_url(
             lambda url: (
@@ -639,7 +668,11 @@ def perform_workflow(page, args):
             page, args.timeout_ms, getattr(args, "trigger_name", None)
         )
         page.wait_for_timeout(args.settle_ms)
-        body, _, _ = resolve_target(page, "body", nth=None)
+        panels = page.locator('[data-testid="model-selector-panel"]:visible')
+        if panels.count() == 1:
+            body = panels.nth(0)
+        else:
+            body, _, _ = resolve_target(page, '[role="menu"]:visible, [role="listbox"]:visible', nth=None)
         detail["snapshot"] = snapshot_target(
             body, args.timeout_ms, args.max_controls
         )
@@ -887,7 +920,8 @@ def perform_action(page, args):
         if args.selector is None:
             return {
                 "action": action,
-                **read_conversation_text(page, args.timeout_ms),
+                **read_conversation_text(page, args.timeout_ms,
+                                         getattr(args, "after_message", 0), getattr(args, "limit", None)),
                 "page": page_info(page),
             }
     target, count, index = resolve_target(page, args.selector, args.nth)
