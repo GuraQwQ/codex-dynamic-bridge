@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-VERSION = "0.5.0"
+VERSION = json.loads((Path(__file__).resolve().parents[2] / "plugin.json").read_text(encoding="utf-8"))["version"]
 MAX_BODY_BYTES = 1_048_576
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
 SCHEDULE_WORKERS = 4

@@ -169,7 +169,7 @@ def staged_plugin(destination, endpoint=None):
         shutil.copytree(
             source,
             stage,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "data"),
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*_test.py", "data"),
         )
         # 暂存时就生成引用最终稳定目录的 Hook，缩短持锁提交阶段。
         atomic_write_json(stage / "hooks.json", hooks_config(destination, endpoint))
@@ -190,6 +190,7 @@ def source_matches(destination, endpoint):
             and "__pycache__" not in path.parts
             and "data" not in path.relative_to(root).parts
             and path.suffix != ".pyc"
+            and not path.name.endswith("_test.py")
             and not (generated_hooks and path.relative_to(root) == Path("hooks.json"))
         }
 

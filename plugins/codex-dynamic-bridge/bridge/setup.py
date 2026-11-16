@@ -24,6 +24,9 @@ MAX_BINARY_BYTES = 268_435_456
 DOWNLOAD_CHUNK_BYTES = 65_536
 DOWNLOAD_ATTEMPTS = 4
 TRUSTED_BINARY_HOSTS = {"storage.googleapis.com"}
+USER_AGENT = "codex-dynamic-bridge/" + json.loads(
+    (Path(__file__).resolve().parents[1] / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+)["version"]
 
 
 class SetupError(RuntimeError):
@@ -159,7 +162,7 @@ def clean_agy_cache(install_dir=None, env=None, allow_system_drive=False, platfo
 
 
 def read_installer(url, opener=urlopen):
-    request = Request(url, headers={"User-Agent": "codex-dynamic-bridge/0.2"})
+    request = Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with opener(request, timeout=30) as response:
             content = response.read(MAX_INSTALLER_BYTES + 1)
@@ -173,7 +176,7 @@ def read_installer(url, opener=urlopen):
 def read_resource(url, max_bytes, opener=urlopen, attempts=DOWNLOAD_ATTEMPTS):
     last_error = None
     for _ in range(attempts):
-        request = Request(url, headers={"User-Agent": "codex-dynamic-bridge/0.2"})
+        request = Request(url, headers={"User-Agent": USER_AGENT})
         try:
             with opener(request, timeout=60) as response:
                 content = response.read(max_bytes + 1)
@@ -297,7 +300,7 @@ def download_verified_binary(
         if offset > MAX_BINARY_BYTES:
             staging_path.unlink()
             offset = 0
-        headers = {"User-Agent": "codex-dynamic-bridge/0.2"}
+        headers = {"User-Agent": USER_AGENT}
         if offset:
             headers["Range"] = f"bytes={offset}-"
         request = Request(url, headers=headers)
